@@ -1,0 +1,57 @@
+name: Romp core release
+
+# Builds the macOS arm64 libretro core that Romp downloads for PS2 games, and
+# publishes it as a release named after the commit it was built from.
+
+on:
+  push:
+    branches: [romp]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: romp-release
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS arm64 core
+    uses: ./.github/workflows/macos_build_libretro.yml
+    permissions:
+      contents: read
+    with:
+      jobName: "libretro Core Build (macOS arm64)"
+      artifactPrefixName: "armsx2-macos-arm64-libretro"
+      fetchTags: true
+
+  publish:
+    name: Publish release
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dl
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="core-$(date -u +%Y%m%d)-${GITHUB_SHA::10}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already published"
+            exit 0
+          fi
+          asset=armsx2_libretro-macos-arm64.zip
+          cp "$(find dl -name '*.zip' | head -1)" "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          gh release create "$tag" "$asset" "$asset.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "ARMSX2 libretro core, ${GITHUB_SHA::10}" \
+            --notes "The ARMSX2 libretro core for Apple Silicon Macs, built from ${GITHUB_SHA::10} on the romp branch. It renders through the frontend's Vulkan device and links only system libraries." \
+            --latest
