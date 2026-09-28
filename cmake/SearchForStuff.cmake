@@ -55,7 +55,9 @@ if (NOT WIN32 AND FREETYPE_LIBRARY_EXT STREQUAL "${CMAKE_STATIC_LIBRARY_SUFFIX}"
 			# archive with unresolved hb_* in it.
 			message(STATUS "Could not run ${ARMSX2_NM} on ${FREETYPE_LIBRARY}, assuming it needs HarfBuzz")
 			set(FREETYPE_NEEDS_HARFBUZZ TRUE)
-		elseif (FREETYPE_UNDEFINED MATCHES "[ \t]_?hb_")
+		# GNU nm indents each name behind a "U"; Apple's nm -u prints bare
+		# names, one per line, so the name can also start a line (or the output).
+		elseif (FREETYPE_UNDEFINED MATCHES "(^|[ \t\n])_?hb_")
 			set(FREETYPE_NEEDS_HARFBUZZ TRUE)
 		endif()
 		unset(FREETYPE_UNDEFINED)

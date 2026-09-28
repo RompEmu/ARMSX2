@@ -36,6 +36,44 @@ fi
 # old for the C++20 here), so every arch-dependent flag below follows this.
 : ${OSX_ARCH:=arm64}
 
+# The libretro core ships as a bare armsx2_libretro.dylib with nothing beside
+# it, so a self-built dylib it links carries an install name under this prefix
+# and loads on the machine that built it and nowhere else. ARMSX2_DEPS_STATIC=1
+# builds every library here as an archive instead, so it all folds into the
+# core - the same switch, and the same reason, as the Linux runner script.
+# Default is shared, unchanged for every existing caller.
+: ${ARMSX2_DEPS_STATIC:=0}
+
+# Normalised before use: a bare `-ne 0` test on ARMSX2_DEPS_STATIC=true is an
+# error, and an erroring test in an if reads as false.
+case "$ARMSX2_DEPS_STATIC" in
+	0|""|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]|[Oo][Ff][Ff]) DEPS_STATIC=0 ;;
+	*) DEPS_STATIC=1 ;;
+esac
+
+if [ "$DEPS_STATIC" -ne 0 ]; then
+	# Qt, KDDockWidgets and the ffmpeg build below are shared-only recipes, and
+	# the core links none of them; refuse rather than hand back a mixed prefix.
+	if [ "$BUILD_QT" -ne 0 ] || [ "$BUILD_FFMPEG" -ne 0 ]; then
+		echo "ARMSX2_DEPS_STATIC=1 needs BUILD_QT=0 and BUILD_FFMPEG=0" >&2
+		exit 1
+	fi
+	SHARED_LIBS=OFF
+	STATIC_LIBS=ON
+	# FreeType 2.14's FT_DYNAMIC_HARFBUZZ defaults ON and dlopens HarfBuzz
+	# instead of linking it. A static prefix has no libharfbuzz.dylib for that
+	# to find, so hinting would quietly get worse; link it for real instead.
+	FT_HARFBUZZ_FLAG="-DFT_DYNAMIC_HARFBUZZ=OFF"
+	# Installs libshaderc_combined.a (glslang and SPIRV-Tools folded in) in
+	# place of libshaderc_shared.dylib; cmake/FindShaderc.cmake takes it first.
+	SHADERC_PATCH="shaderc-changes-static.patch"
+else
+	SHARED_LIBS=ON
+	STATIC_LIBS=OFF
+	FT_HARFBUZZ_FLAG=
+	SHADERC_PATCH="shaderc-changes.patch"
+fi
+
 export MACOSX_DEPLOYMENT_TARGET=11.0
 
 NPROCS="$(getconf _NPROCESSORS_ONLN)"
@@ -150,7 +188,7 @@ echo "Installing SDL..."
 rm -fr "$SDL"
 tar xf "$SDL.tar.gz"
 cd "$SDL"
-cmake -B build "${CMAKE_COMMON[@]}" -DSDL_VIDEO=OFF -DSDL_POWER=OFF -DSDL_SENSOR=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF -DSDL_TEST_LIBRARY=OFF -DBUILD_SHARED_LIBS=ON
+cmake -B build "${CMAKE_COMMON[@]}" -DSDL_VIDEO=OFF -DSDL_POWER=OFF -DSDL_SENSOR=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF -DSDL_TEST_LIBRARY=OFF -DBUILD_SHARED_LIBS=$SHARED_LIBS -DSDL_SHARED=$SHARED_LIBS -DSDL_STATIC=$STATIC_LIBS
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -180,7 +218,7 @@ echo "Installing Zstd..."
 rm -fr "zstd-$ZSTD"
 tar xf "zstd-$ZSTD.tar.gz"
 cd "zstd-$ZSTD"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DZSTD_BUILD_PROGRAMS=OFF -B build-dir build/cmake
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DZSTD_BUILD_SHARED=$SHARED_LIBS -DZSTD_BUILD_STATIC=$STATIC_LIBS -DZSTD_BUILD_PROGRAMS=OFF -B build-dir build/cmake
 make -C build-dir "-j$NPROCS"
 make -C build-dir install
 cd ..
@@ -189,7 +227,7 @@ echo "Installing LZ4..."
 rm -fr "lz4-$LZ4"
 tar xf "lz4-$LZ4.tar.gz"
 cd "lz4-$LZ4"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF -B build-dir build/cmake
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DBUILD_STATIC_LIBS=$STATIC_LIBS -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF -B build-dir build/cmake
 make -C build-dir "-j$NPROCS"
 make -C build-dir install
 cd ..
@@ -200,7 +238,7 @@ tar xf "libpng-$LIBPNG.tar.xz"
 gzip -kd -f "libpng-$LIBPNG-apng.patch.gz"
 cd "libpng-$LIBPNG"
 patch -p1 < "../libpng-$LIBPNG-apng.patch"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPNG_TESTS=OFF -DPNG_FRAMEWORK=OFF -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DPNG_SHARED=$SHARED_LIBS -DPNG_STATIC=$STATIC_LIBS -DPNG_TESTS=OFF -DPNG_FRAMEWORK=OFF -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -209,7 +247,7 @@ echo "Installing libjpegturbo..."
 rm -fr "libjpeg-turbo-$LIBJPEGTURBO"
 tar xf "libjpeg-turbo-$LIBJPEGTURBO.tar.gz"
 cd "libjpeg-turbo-$LIBJPEGTURBO"
-cmake "${CMAKE_COMMON[@]}" "$CMAKE_ARCH_X64" -DENABLE_STATIC=OFF -DENABLE_SHARED=ON -B build
+cmake "${CMAKE_COMMON[@]}" "$CMAKE_ARCH_X64" -DENABLE_STATIC=$STATIC_LIBS -DENABLE_SHARED=$SHARED_LIBS -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -220,7 +258,7 @@ tar xf "libwebp-$LIBWEBP.tar.gz"
 cd "libwebp-$LIBWEBP"
 cmake "${CMAKE_COMMON[@]}" -B build \
 	-DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF \
-	-DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF -DBUILD_SHARED_LIBS=ON
+	-DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF -DBUILD_SHARED_LIBS=$SHARED_LIBS
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -229,7 +267,7 @@ echo "Building FreeType without HarfBuzz..."
 rm -fr "freetype-$FREETYPE"
 tar xf "freetype-$FREETYPE.tar.xz"
 cd "freetype-$FREETYPE"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_DISABLE_HARFBUZZ=TRUE -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_DISABLE_HARFBUZZ=TRUE -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -238,7 +276,7 @@ echo "Building HarfBuzz..."
 rm -fr "harfbuzz-$HARFBUZZ"
 tar xf "harfbuzz-$HARFBUZZ.tar.gz"
 cd "harfbuzz-$HARFBUZZ"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DHB_BUILD_UTILS=OFF -DHB_BUILD_GPU=OFF -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DHB_BUILD_UTILS=OFF -DHB_BUILD_GPU=OFF -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -247,12 +285,16 @@ echo "Building FreeType with HarfBuzz..."
 rm -fr "freetype-$FREETYPE"
 tar xf "freetype-$FREETYPE.tar.xz"
 cd "freetype-$FREETYPE"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_REQUIRE_HARFBUZZ=TRUE -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_REQUIRE_HARFBUZZ=TRUE $FT_HARFBUZZ_FLAG -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
 
 # MoltenVK is told which slice to build through VALID_ARCHS below.
+# Not in a static prefix: the only thing built from one is the libretro core,
+# which renders on the frontend's Vulkan device and opens MoltenVK at runtime
+# (Vulkan::LoadVulkanLibrary) rather than linking it.
+if [ "$DEPS_STATIC" -eq 0 ]; then
 echo "Installing MoltenVK..."
 rm -fr "MoltenVK-${MOLTENVK}"
 tar xf "MoltenVK-$MOLTENVK.tar.gz"
@@ -265,6 +307,7 @@ XCODEBUILD_EXTRA_ARGS="VALID_ARCHS=$OSX_ARCH" ./fetchDependencies --macos
 XCODEBUILD="set -o pipefail && xcodebuild VALID_ARCHS=$OSX_ARCH" make macos MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0 MVK_CONFIG_USE_METAL_PRIVATE_API=1
 cp Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib "$INSTALLDIR/lib/"
 cd ..
+fi
 
 if [ "$BUILD_QT" -ne 0 ]; then
 echo "Installing Qt Base..."
@@ -358,7 +401,7 @@ mv "SPIRV-Headers-$SHADERC_SPIRVHEADERS" "spirv-headers"
 tar xf "../../shaderc-spirv-tools-$SHADERC_SPIRVTOOLS.tar.gz"
 mv "SPIRV-Tools-$SHADERC_SPIRVTOOLS" "spirv-tools"
 cd ..
-patch -p1 < "$SCRIPTDIR/../common/shaderc-changes.patch"
+patch -p1 < "$SCRIPTDIR/../common/$SHADERC_PATCH"
 cmake "${CMAKE_COMMON[@]}" "$CMAKE_ARCH_UNIVERSAL" -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON -B build
 make -C build "-j$NPROCS"
 make -C build install
@@ -404,7 +447,7 @@ echo "Building PlutoVG..."
 rm -fr "plutovg-$PLUTOVG"
 tar xf "plutovg-$PLUTOVG.tar.gz"
 cd "plutovg-$PLUTOVG"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPLUTOVG_BUILD_EXAMPLES=OFF -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DPLUTOVG_BUILD_EXAMPLES=OFF -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -413,7 +456,7 @@ echo "Building PlutoSVG..."
 rm -fr "plutosvg-$PLUTOSVG"
 tar xf "plutosvg-$PLUTOSVG.tar.gz"
 cd "plutosvg-$PLUTOSVG"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPLUTOSVG_ENABLE_FREETYPE=ON -DPLUTOSVG_BUILD_EXAMPLES=OFF -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -DPLUTOSVG_ENABLE_FREETYPE=ON -DPLUTOSVG_BUILD_EXAMPLES=OFF -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..
@@ -422,7 +465,7 @@ echo "Building RapidYAML..."
 rm -fr "rapidyaml-$RAPIDYAML-src"
 tar xf "rapidyaml-$RAPIDYAML-src.tgz"
 cd "rapidyaml-$RAPIDYAML-src"
-cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -B build
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=$SHARED_LIBS -B build
 make -C build "-j$NPROCS"
 make -C build install
 cd ..

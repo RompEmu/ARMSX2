@@ -1,0 +1,183 @@
+name: macOS libretro Core Build Steps
+
+# ARMSX2: builds the libretro core (armsx2_libretro.dylib) for RetroArch and
+# other libretro frontends on Apple Silicon. The GS renders on the frontend's
+# Vulkan device (MoltenVK inside RetroArch; see
+# pcsx2/GS/Renderers/Vulkan/VKLibretro.cpp) - there is no GL renderer on Apple -
+# so the core links no Qt, no MoltenVK and no window system of its own.
+# Dependencies come from build-dependencies-slice.sh in its static mode, so
+# the core is one self-contained dylib with nothing but system libraries in its
+# load commands. Packaged as a .zip holding that dylib.
+
+on:
+  workflow_call:
+    inputs:
+      jobName:
+        required: true
+        type: string
+      artifactPrefixName:
+        required: true
+        type: string
+      os:
+        required: false
+        type: string
+        default: macos-26
+      fetchTags:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build_libretro:
+    name: ${{ inputs.jobName }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 90
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 9
+      CCACHE_MAXSIZE: 100M
+      # Matches the deployment target build-dependencies-slice.sh builds the
+      # dependencies against, so the core and its archives agree on one.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Tags
+        if: ${{ inputs.fetchTags }}
+        run: git fetch --tags --no-recurse-submodules
+
+      - name: Use Xcode 26.5
+        run: sudo xcode-select -s /Applications/Xcode_26.5.app
+
+      # The GS's Metal shaders are compiled into the core, as they are into the
+      # app, so the core needs the same toolchain the Qt job installs.
+      - name: Install Metal Toolchain
+        run: |
+          for i in {1..5}; do
+            if xcrun metal -v; then break; fi
+            xcodebuild -downloadComponent MetalToolchain
+          done
+
+      - name: Prepare Artifact Metadata
+        id: artifact-metadata
+        shell: bash
+        env:
+          PREFIX: ${{ inputs.artifactPrefixName }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./.github/workflows/scripts/common/name-artifacts.sh
+
+      - name: Install Packages
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_ANALYTICS: 1
+        run: |
+          if ! brew install ccache nasm ninja; then
+            brew update
+            brew install ccache nasm ninja
+          fi
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
+
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ${{ inputs.os }} arm64 libretro ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: ${{ inputs.os }} arm64 libretro ccache
+
+      - name: Cache Dependencies
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          path: ~/deps
+          # Its own cache, not the Qt job's: that one is a shared, universal
+          # prefix from build-dependencies-universal.sh, this is a static arm64
+          # one without Qt, ffmpeg or MoltenVK.
+          key: ${{ inputs.os }} arm64 static-deps ${{ hashFiles('.github/workflows/scripts/macos/build-dependencies-slice.sh', '.github/workflows/scripts/common/*.patch') }}
+
+      - name: Build Dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          OSX_ARCH=arm64 BUILD_QT=0 BUILD_FFMPEG=0 ARMSX2_DEPS_STATIC=1 \
+            .github/workflows/scripts/macos/build-dependencies-slice.sh "$HOME/deps"
+
+      - name: Generate CMake
+        run: |
+          # Same core options as the Linux job and the buildbot's macOS recipe
+          # (.gitlab-ci.yml). No page size override: Apple Silicon is 16K
+          # everywhere, which is what the build detects on this runner.
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DCMAKE_PREFIX_PATH="$HOME/deps" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_QT_UI=OFF \
+            -DENABLE_SDL_FRONTEND=OFF \
+            -DENABLE_LIBRETRO=ON \
+            -DENABLE_GSRUNNER=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_RECOMPILER_TEST_HOOKS=OFF \
+            -DENABLE_SETCAP=OFF \
+            -DUSE_BACKTRACE=OFF \
+            -DX11_API=OFF \
+            -DWAYLAND_API=OFF \
+            -DDISABLE_ADVANCE_SIMD=TRUE \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+
+      - name: Build armsx2_libretro
+        working-directory: build
+        run: |
+          ccache -p
+          ccache -z
+          ninja pcsx2-libretro
+          ccache -s
+
+      - name: Check the core is self-contained
+        run: |
+          DYLIB=$(find build -name 'armsx2_libretro.dylib' | head -1)
+          test -n "$DYLIB" || { echo "armsx2_libretro.dylib not found"; exit 1; }
+          otool -L "$DYLIB"
+          # Anything outside the OS is a library the user's Mac has no copy of.
+          # otool -L lists the dylib's own install name first; that one is not
+          # a dependency, so it is dropped by name.
+          ID=$(otool -D "$DYLIB" | tail -n +2)
+          if otool -L "$DYLIB" | tail -n +2 | awk '{print $1}' | grep -vxF "$ID" | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+            echo "::error::armsx2_libretro.dylib links libraries outside the OS (listed above)"
+            exit 1
+          fi
+
+      - name: Package libretro Core Zip
+        env:
+          NAME: ${{ steps.artifact-metadata.outputs.artifact-name }}
+        run: |
+          DYLIB=$(find build -name 'armsx2_libretro.dylib' | head -1)
+          # -x drops local symbols only; the exported retro_* entry points stay.
+          strip -x "$DYLIB"
+          # Stripping invalidates the linker's ad-hoc signature, and arm64 macOS
+          # refuses to load unsigned code at all, so sign it again.
+          codesign --force --sign - "$DYLIB"
+          codesign --verify --verbose "$DYLIB"
+          mkdir -p "pkg/${NAME}"
+          cp -v "$DYLIB" "pkg/${NAME}/"
+          mkdir -p "$GITHUB_WORKSPACE"/ci-artifacts/
+          (cd pkg && zip -qry "$GITHUB_WORKSPACE/ci-artifacts/${NAME}.zip" "${NAME}")
+          ls -l "$GITHUB_WORKSPACE"/ci-artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact-metadata.outputs.artifact-name }}
+          path: ci-artifacts
