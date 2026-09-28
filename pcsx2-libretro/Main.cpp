@@ -241,6 +241,13 @@ bool LibretroCore::InitializeConfig()
 		// Audio goes out through retro_run pulling the stream ring; the Null
 		// backend keeps SPU2 mixing into the ring with no device thread.
 		s_base_settings->SetStringValue("SPU2/Output", "Backend", "Null");
+
+		// Memory cards are the game's saves, so they go in the frontend's save
+		// directory: the one a sandboxed frontend lets the core write to.
+		const char* save_base = nullptr;
+		if (environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_base) && save_base && *save_base)
+			s_base_settings->SetStringValue("Folders", "MemoryCards",
+				Path::Combine(Path::Combine(save_base, "pcsx2"), "memcards").c_str());
 	}
 
 	Error save_error;
