@@ -6,6 +6,8 @@ name: Romp core release
 on:
   push:
     branches: [romp]
+    paths-ignore:
+      - .github/workflows/romp_sync.yml
   workflow_dispatch:
 
 permissions: {}
