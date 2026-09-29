@@ -1,0 +1,50 @@
+name: Romp upstream sync
+
+# Merges upstream ARMSX2 into the romp branch each week and, when anything came
+# in, starts the core release, which publishes only if the core builds.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: romp-sync
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: romp
+          fetch-depth: 0
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch https://github.com/ARMSX2/ARMSX2.git master
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Already up to date with upstream"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --no-edit FETCH_HEAD -m "Merge upstream ARMSX2"
+          git push origin HEAD:romp
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Start the core release
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run romp_release.yml --ref romp
