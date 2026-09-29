@@ -22,10 +22,22 @@ jobs:
       contents: write
       actions: write
     steps:
+      - name: Check for the sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.ROMP_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::ROMP_SYNC_TOKEN is not set. Upstream changes workflow files, which the built-in token may not push."
+            exit 1
+          fi
+
+      # Upstream changes files under .github/workflows, which only a token with the
+      # workflows permission may push.
       - uses: actions/checkout@v7
         with:
           ref: romp
           fetch-depth: 0
+          token: ${{ secrets.ROMP_SYNC_TOKEN }}
 
       - name: Merge upstream master
         id: merge
