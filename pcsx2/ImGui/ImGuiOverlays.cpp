@@ -29,6 +29,8 @@
 #include "SIO/Pad/PadBase.h"
 #include "USB/USB.h"
 #include "VMManager.h"
+#include "DEV9/ACJV.h"
+#include "common/ARCADE.h"
 
 #include "common/BitUtils.h"
 #include "common/Error.h"
@@ -120,6 +122,7 @@ extern "C" const char* ARMSX2_iOSGetDeviceStatsOverlayLine();
 namespace GSLsfg
 {
 	std::string GetStatusText();
+	bool StatusIsProblem();
 }
 #endif
 
@@ -132,6 +135,16 @@ static std::string LsfgStatusText()
 	return GSLsfg::GetStatusText();
 #else
 	return {};
+#endif
+}
+
+/// Frame generation is on and something is wrong with it; see GSLsfg::StatusIsProblem.
+static bool LsfgStatusIsProblem()
+{
+#ifdef ENABLE_VULKAN
+	return GSLsfg::StatusIsProblem();
+#else
+	return false;
 #endif
 }
 
@@ -240,6 +253,7 @@ namespace ImGuiManager
 	static void DrawInputRecordingOverlay(float& position_y, float scale, float margin, float spacing);
 	static void DrawTextureReplacementsOverlay(float& position_y, float scale, float margin, float spacing);
 	static void DrawIndicatorsOverlay(float& position_y, float scale, float margin, float spacing);
+	static void DrawArcadeGunCrosshairs(float scale);
 } // namespace ImGuiManager
 
 __ri void ImGuiManager::FormatProcessorStat(SmallStringBase& text, double usage, double time)
@@ -276,8 +290,14 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 	// reasons: it is driven by the LSFG setting and not by any OsdShow* flag, and the shrink-to-fit
 	// below keys off this word changing — sharing a bit would leave the block sized for the wrong
 	// set of lines the moment the LSFG line appeared or went away.
+	//
+	// The line comes with the rest of the performance overlay, so with the overlay off a healthy
+	// frame generation shows nothing (it stayed on screen whatever the overlay said, and with it,
+	// ImGui always drew, which kept frame generation off the game's own image). A problem still
+	// shows on its own: "on but silent" can't be told from "on and broken".
 	const std::string lsfg_status = LsfgStatusText();
-	enabled_lines |= static_cast<u32>(!lsfg_status.empty()) << 12;
+	const bool lsfg_line = !lsfg_status.empty() && (enabled_lines != 0 || LsfgStatusIsProblem());
+	enabled_lines |= static_cast<u32>(lsfg_line) << 12;
 	if (enabled_lines == 0)
 		return;
 
@@ -552,7 +572,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				s_speed_line.append_format("{}ARMSX2 " ARMSX2_IOS_OSD_VERSION " | Core: {}",
 					s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #elif defined(__ANDROID__)
-				s_speed_line.append_format("{}ARMSX2 2.7", s_speed_line.empty() ? "" : " | ");
+				s_speed_line.append_format("{}ARMSX2 2.8", s_speed_line.empty() ? "" : " | ");
 #else
 				s_speed_line.append_format("{}PCSX2 {}", s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #endif
@@ -679,7 +699,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				FormatProcessorStat(s_cpu_usage_gs_line, PerformanceMetrics::GetGSThreadUsage(), PerformanceMetrics::GetGSThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_line.c_str(), OsdTextColor());
 
-				// Only exists under GSBackThreadMode >= Lockstep. The line above is the MTGS
+				// Only exists with GS multi-threading on. The line above is the MTGS
 				// thread alone, so without this one the split's second half is invisible.
 				if (PerformanceMetrics::HasGSBackThread())
 				{
@@ -1692,6 +1712,9 @@ void SaveStateSelectorUI::Close()
 
 void SaveStateSelectorUI::RefreshList(const std::string& serial, u32 crc)
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	for (ListEntry& entry : s_slots)
 	{
 		if (entry.preview_texture)
@@ -1711,6 +1734,7 @@ void SaveStateSelectorUI::Clear()
 		if (li.preview_texture)
 		{
 			MTGS::RunOnGSThread([tex = li.preview_texture.release()]() {
+				GSDrainBackQueue();
 				g_gs_device->Recycle(tex);
 			});
 		}
@@ -1723,6 +1747,8 @@ void SaveStateSelectorUI::Clear()
 
 void SaveStateSelectorUI::DestroyTextures()
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
 	Close();
 
 	for (ListEntry& entry : s_slots)
@@ -2126,8 +2152,37 @@ void ImGuiManager::RenderOverlays()
 	DrawSettingsOverlay(scale, margin, bottom_margin, spacing);
 	DrawShaderCompileIndicator(scale, margin, bottom_margin, spacing);
 	DrawInputsOverlay(scale, margin, bottom_margin, spacing);
+	DrawArcadeGunCrosshairs(scale);
 	if (SaveStateSelectorUI::s_open)
 		SaveStateSelectorUI::Draw();
+}
+
+// An arcade light gun aimed with a stick has nothing on screen to show where it points (a finger on a
+// touchscreen, or a real gun, needs nothing): a crosshair per player, while that player's stick aims.
+void ImGuiManager::DrawArcadeGunCrosshairs(float scale)
+{
+	if (!Arcade::IsActive() || ACJV::GetMode() != JVS_MODE::LIGHTGUN)
+		return;
+
+	static constexpr ImU32 colors[2] = {IM_COL32(255, 72, 72, 230), IM_COL32(72, 160, 255, 230)};
+	ImDrawList* const dl = ImGui::GetBackgroundDrawList();
+	const float radius = 11.0f * scale;
+	const float thickness = std::max(2.0f * scale, 1.0f);
+	for (u32 player = 0; player < 2; player++)
+	{
+		float dx, dy;
+		if (!ACJV::GetGunStickAim(player, &dx, &dy))
+			continue;
+		float x, y;
+		GSTranslateDisplayToWindowCoordinates(dx, dy, &x, &y);
+		const ImVec2 c(x, y);
+		dl->AddCircle(c, radius, IM_COL32(0, 0, 0, 160), 0, thickness + 2.0f * scale);
+		dl->AddCircle(c, radius, colors[player], 0, thickness);
+		dl->AddLine(ImVec2(c.x - radius * 1.6f, c.y), ImVec2(c.x - radius * 0.5f, c.y), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x + radius * 0.5f, c.y), ImVec2(c.x + radius * 1.6f, c.y), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x, c.y - radius * 1.6f), ImVec2(c.x, c.y - radius * 0.5f), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x, c.y + radius * 0.5f), ImVec2(c.x, c.y + radius * 1.6f), colors[player], thickness);
+	}
 }
 
 std::string SaveStateSelectorUI::GetSaveStateTimestampSummary(const std::time_t& modification_time)

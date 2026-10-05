@@ -8,6 +8,7 @@
 #include "GS/Renderers/Common/GSInterlaceModePolicy.h"
 #include "GS/Renderers/Common/GSPresentationPolicy.h"
 #include "GS/Renderers/Common/GSSnapshotPolicy.h"
+#include "GS/DriverReport/GSDriverReport.h"
 #include "GS/GSDump.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
@@ -902,15 +903,17 @@ void GSRenderer::EndPresentFrame()
 
 void GSRenderer::SubmitVsync(u32 field, bool registers_written)
 {
-	GSBackQueue::VsyncRecord rec;
-	rec.field = field;
-	rec.registers_written = registers_written;
-	rec.idle_frame = IsIdleFrame(); // front-computable: compares serials against the last frame's
-
 	// VSYNC is never queued: present runs on the MTGS thread behind a drain, so
 	// the back thread stays off the GSDevice on present paths entirely (which
 	// is also what keeps SW + GL-present devices legal in queued modes).
 	DrainBackQueue();
+
+	GSBackQueue::VsyncRecord rec;
+	rec.field = field;
+	rec.registers_written = registers_written;
+	// Compares this object's draw and transfer serials with the last frame's. The back thread
+	// advances them as it executes records, so this has to follow the drain.
+	rec.idle_frame = IsIdleFrame();
 	ExecVsyncRecord(rec);
 }
 
@@ -1267,6 +1270,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				// path either has no output to draw or redraws the previous one. Frame generation
 				// reads it so it does not interpolate motion into frames the game never drew.
 				g_gs_device->NotePresentHasNewFrame();
+				// And how: the blit frame generation repeats for its generated frames when it runs on
+				// the game's own image, which needs the present to be only that blit. The upscalers and
+				// CAS above draw it themselves, a TV shader filters it, rotation turns it.
+				g_gs_device->NotePresentGeometry(src_rect, draw_rect, GSConfig.LinearPresent != GSPostBilinearMode::Off,
+					GSConfig.Upscaler == GSUpscaler::Off && GSConfig.CASMode == GSCASMode::Disabled &&
+						s_tv_shader_indices[GSConfig.TVShader] == PresentShader::COPY &&
+						GSConfig.LinearPresent != GSPostBilinearMode::BilinearSharp &&
+						GSConfig.Rotation == DisplayRotation::Rot0 && !g_gs_device->UsesLowerLeftOrigin());
 			}
 
 			EndPresentFrame();
@@ -1360,6 +1371,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			}
 
 			delete[] fd.data;
+
+			// Which driver drew this, beside the dump. Never fails the dump.
+			GSDriverReport::WriteSidecarForDump(m_snapshot);
 
 			Host::AddKeyedOSDMessage("GSDump",
 				fmt::format(TRANSLATE_FS("GS", "Saving {0} GS dump {1} to '{2}'"),
@@ -1542,6 +1556,31 @@ void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float
 
 	*display_x = rel_x / draw_width;
 	*display_y = rel_y / draw_height;
+}
+
+// The other way: where on the window a normalized display position is (an arcade light gun's stick aim,
+// for its crosshair).
+void GSTranslateDisplayToWindowCoordinates(float display_x, float display_y, float* window_x, float* window_y)
+{
+	*window_x = s_last_draw_rect.x + display_x * (s_last_draw_rect.z - s_last_draw_rect.x);
+	*window_y = s_last_draw_rect.y + display_y * (s_last_draw_rect.w - s_last_draw_rect.y);
+}
+
+// The same mapping without collapsing a position off the picture to (-1,-1): the caller gets graded
+// coordinates beyond [0,1] (an arcade lightgun's aim beside the screen, PCSX2x6).
+void GSTranslateWindowToDisplayCoordinatesUnclamped(float window_x, float window_y, float* display_x, float* display_y)
+{
+	const float draw_width = s_last_draw_rect.z - s_last_draw_rect.x;
+	const float draw_height = s_last_draw_rect.w - s_last_draw_rect.y;
+	if (draw_width <= 0.0f || draw_height <= 0.0f)
+	{
+		*display_x = -1.0f;
+		*display_y = -1.0f;
+		return;
+	}
+
+	*display_x = (window_x - s_last_draw_rect.x) / draw_width;
+	*display_y = (window_y - s_last_draw_rect.y) / draw_height;
 }
 
 void GSSetDisplayAlignment(GSDisplayAlignment alignment)

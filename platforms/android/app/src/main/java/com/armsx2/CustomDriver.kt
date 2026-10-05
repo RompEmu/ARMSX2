@@ -52,8 +52,30 @@ object CustomDriver {
         val label: String,
         val releasesUrl: String,
         val idPrefix: String,
+        /** Whether to list this source for the device's GL_RENDERER (null when unknown).
+         *  Sources that only build for one GPU family say so here; the rest list everywhere. */
+        val supports: (renderer: String?) -> Boolean = { true },
     )
+
+    /** Mali architecture v11: the G615 and G715 (Immortalis-G715 included), the only GPUs
+     *  our libmali packs drive so far. GL_RENDERER reads like "Mali-G615 MC6" or
+     *  "Mali-G715-Immortalis MC11". */
+    private val MALI_V11 = Regex("""\bG[67]15\b""", RegexOption.IGNORE_CASE)
+    internal fun isMaliV11(renderer: String?): Boolean =
+        renderer != null &&
+            (renderer.contains("Mali", ignoreCase = true) || renderer.contains("Immortalis", ignoreCase = true)) &&
+            MALI_V11.containsMatchIn(renderer)
+
     private val DRIVER_SOURCES = listOf(
+        // Our own Vulkan driver for Mali, replacing Arm's on the kbase kernel driver. One
+        // adrenotools pack per release (meta.json + libvulkan_armsx2_mali.so), loaded the
+        // same way as the Turnip packs. Listed only on the GPUs it supports.
+        DriverSource(
+            "ARMSX2 · libmali",
+            "https://api.github.com/repos/bmdhacks/armsx2-libmali/releases",
+            "armsx2libmali",
+            supports = ::isMaliV11,
+        ),
         // Our own Turnip: Mesa with the ARMSX2 driver patches, built as adrenotools packs.
         // The emulator recognises these builds by the `(git-axfl<N>-…)` token in
         // driverInfo and takes the barrier-less in-pass read road on Adreno 650 and up
@@ -189,13 +211,13 @@ object CustomDriver {
 
     // ---- GitHub release list ------------------------------------------------
 
-    /** Fetch the K11MCH1/AdrenoToolsDrivers releases and flatten into
-     *  one RemoteDriver per .zip asset. Suspending — caller must wrap
+    /** Fetch every source that supports [renderer] (the system GL_RENDERER)
+     *  and flatten into one RemoteDriver per .zip asset. Suspending — caller must wrap
      *  in `withContext(Dispatchers.IO)` (the JNI call blocks the
      *  calling thread). Returns empty list on any network/parse error;
      *  callers can detect "I had drivers shown a moment ago, now
      *  nothing" by tracking the previous size. */
-    fun fetchRemote(): List<RemoteDriver> {
+    fun fetchRemote(renderer: String?): List<RemoteDriver> {
         val userAgent = "ARMSX2/" + runCatching {
             NativeApp.getBuildVersion()
         }.getOrNull().orEmpty().ifEmpty { "dev" }
@@ -204,6 +226,7 @@ object CustomDriver {
         // Sequential per source; one dead/rate-limited source returns empty and
         // never blanks the others. Dedup by id guards the LazyVerticalGrid key set.
         for (src in DRIVER_SOURCES) {
+            if (!src.supports(renderer)) continue
             for (rd in fetchSource(src, userAgent)) {
                 if (seen.add(rd.id)) out += rd
             }
@@ -413,6 +436,79 @@ object CustomDriver {
      *  system loader. The native side reads these on the next
      *  Vulkan::LoadVulkanLibrary call (first MTGS::Open), so this must
      *  be called BEFORE MainActivityRuntime.start()'s applyRendererPrefs runs the VM. */
+    // ---- Turnip options (#719) ------------------------------------------------------------
+    // Mesa drivers take their tuning from the process environment, the way Eden's Freedreno
+    // settings page sets it: FD_DEV_FEATURES is read each time the Vulkan device is created, so
+    // it follows the next game start; TU_DEBUG is read once, when the driver first loads. The
+    // Qualcomm driver reads none of it, so these do nothing unless a Turnip build is in use.
+
+    private const val KEY_UBWC_HINT = "driver.turnip.ubwcFlagHint"
+    private const val KEY_ENV = "driver.turnip.env"
+    private const val UBWC_HINT = "enable_tp_ubwc_flag_hint"
+
+    // Only the Mesa families. The same environment carries the app's own switches (the Vulkan
+    // loader path, ANGLE's libraries), and a stray line must not be able to reach those.
+    private val ENV_PREFIXES = listOf("FD_", "TU_", "IR3_", "MESA_")
+    private val ENV_NAME = Regex("[A-Z][A-Z0-9_]*")
+
+    /** What [applyDriverEnv] set last time, so a variable taken out is also taken back. */
+    private val appliedEnv = HashSet<String>()
+
+    /** FD_DEV_FEATURES enable_tp_ubwc_flag_hint=1: recent Turnip builds draw glitches on
+     *  Snapdragon 8 Gen 2 (Adreno 740) without it. */
+    fun ubwcFlagHint(): Boolean = MainActivityRuntime.prefs.getBoolean(KEY_UBWC_HINT, false)
+
+    fun setUbwcFlagHint(on: Boolean) {
+        MainActivityRuntime.prefs.edit().putBoolean(KEY_UBWC_HINT, on).apply()
+    }
+
+    /** The user's own variables, one NAME=value per line. */
+    fun driverEnvText(): String = MainActivityRuntime.prefs.getString(KEY_ENV, "") ?: ""
+
+    fun setDriverEnvText(text: String) {
+        MainActivityRuntime.prefs.edit().putString(KEY_ENV, text).apply()
+    }
+
+    /** NAME=value lines, keeping only Mesa variables. Blank lines and # comments are skipped. */
+    internal fun parseDriverEnv(text: String): LinkedHashMap<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val eq = line.indexOf('=')
+            if (eq <= 0) continue
+            val name = line.substring(0, eq).trim()
+            if (!ENV_NAME.matches(name) || ENV_PREFIXES.none { name.startsWith(it) }) continue
+            out[name] = line.substring(eq + 1).trim()
+        }
+        return out
+    }
+
+    /** The variables to set: the user's lines, with the UBWC hint joined onto any
+     *  FD_DEV_FEATURES they wrote (features are colon-separated). */
+    internal fun driverEnv(text: String, ubwcHint: Boolean): LinkedHashMap<String, String> {
+        val vars = parseDriverEnv(text)
+        if (ubwcHint) {
+            val features = vars["FD_DEV_FEATURES"].orEmpty()
+            if (!features.split(':').any { it.substringBefore('=').trim() == UBWC_HINT })
+                vars["FD_DEV_FEATURES"] =
+                    if (features.isBlank()) "$UBWC_HINT=1" else "$features:$UBWC_HINT=1"
+        }
+        return vars
+    }
+
+    /** Put the Turnip options into the environment. Runs before each game start, ahead of the
+     *  Vulkan device being created; a variable dropped since the last call is unset. */
+    fun applyDriverEnv() {
+        val vars = driverEnv(driverEnvText(), ubwcFlagHint())
+        for (name in appliedEnv - vars.keys) runCatching { android.system.Os.unsetenv(name) }
+        for ((name, value) in vars) runCatching { android.system.Os.setenv(name, value, true) }
+        appliedEnv.clear()
+        appliedEnv.addAll(vars.keys)
+        if (vars.isNotEmpty())
+            Log.i(TAG, "driver env: " + vars.entries.joinToString(" ") { "${it.key}=${it.value}" })
+    }
+
     fun applyToNative(context: Context, installed: InstalledDriver?) {
         if (installed == null) {
             NativeApp.setCustomVulkanDriver("", "", "", "")

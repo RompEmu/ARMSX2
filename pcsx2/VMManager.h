@@ -17,6 +17,11 @@
 
 enum class CDVD_SourceType : uint8_t;
 
+namespace Threading
+{
+	class ThreadHandle;
+}
+
 enum class VMState
 {
 	Shutdown,
@@ -41,6 +46,13 @@ struct VMBootParameters
 	std::optional<bool> start_turbo;
 	std::optional<bool> start_unlimited;
 	bool disable_achievements_hardcore_mode = false;
+
+	/// An arcade game (.acgame, Namco System 246/256) on a host whose game folders are not plain paths
+	/// (Android's documents): where the host found the boot ELF, the media image and the SRAM file the
+	/// .acgame names. An empty one is looked for next to the .acgame.
+	std::string arcade_elf;
+	std::string arcade_media;
+	std::string arcade_sram;
 };
 
 enum class VMBootResult
@@ -264,6 +276,9 @@ namespace VMManager
 	/// Returns true if the specified path is an ELF.
 	bool IsElfFileName(const std::string_view path);
 
+	/// Returns true if the specified path is an arcade game (.acgame, Namco System 246/256).
+	bool IsArcadeGameFileName(const std::string_view path);
+
 	/// Returns true if the specified path is a blockdump.
 	bool IsBlockDumpFileName(const std::string_view path);
 
@@ -378,6 +393,19 @@ namespace VMManager
 
 		/// Resets/clears all execution/code caches.
 		void ClearCPUExecutionCaches();
+
+		/// Called by the GS back thread (GS multi-threading) on itself when it starts, and with
+		/// nullptr just before it exits. Applies the placement SetEmuThreadAffinities chose for it,
+		/// and lets later placement changes reach it. Returns the mask applied; 0 = any processor.
+		u64 RegisterGSBackThread(const Threading::ThreadHandle* handle);
+
+		/// Overrides the GS back thread's placement until affinities are next applied; 0 = any
+		/// processor. For measurement tools.
+		void SetGSBackThreadAffinity(u64 mask);
+
+		/// Re-derives the GS back thread's placement from where the MTGS thread is allowed to run
+		/// now, for tools that move the MTGS thread themselves. Returns the mask applied.
+		u64 PlaceGSBackThreadNearGSThread();
 
 		/// Returns a list of processors in the system, suitable for pinning for the software renderer.
 		const std::vector<u32>& GetSoftwareRendererProcessorList();

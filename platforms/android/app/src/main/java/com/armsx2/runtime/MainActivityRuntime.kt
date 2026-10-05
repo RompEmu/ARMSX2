@@ -786,8 +786,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (affinity != bootCfg.output.affinityMode)
                         println("@@ANDROID_AFFINITY@@ sustained performance on -> affinity forced to Disabled")
                     runCatching { NativeApp.setAffinityMode(affinity) }
-                    // The hold itself waits for the VM to come up. BIOS boots skip it.
-                    if (bootCfg.output.autoProgressiveScan)
+                    // The hold itself waits for the VM to come up. BIOS boots skip it, and so do
+                    // arcade games, where Triangle+Cross are two of the cabinet's buttons.
+                    val arcadeLaunch = com.armsx2.arcade.Arcade.isArcadeLaunch(m_szGamefile, currentGame.value)
+                    if (bootCfg.output.autoProgressiveScan && !arcadeLaunch)
                         startAutoProgressiveScanHold()
                     // Bank a copy of the cards this boot will mount, while they are still closed.
                     // Cheap and silent: it only writes when the card verifies AND its contents
@@ -803,7 +805,10 @@ open class MainActivityRuntime : ComponentActivity() {
                         }
                     }
                     stagePerGameSettingsFile(currentGame.value?.settingsKey)
-                    NativeApp.runVMThread(m_szGamefile)
+                    if (arcadeLaunch)
+                        runArcadeGame(m_szGamefile)
+                    else
+                        NativeApp.runVMThread(m_szGamefile)
                 } finally {
                     // runVMThread blocks until the VM exits (Stopping/Shutdown
                     // observed). Drop back to STOPPED only after native has
@@ -866,6 +871,37 @@ open class MainActivityRuntime : ComponentActivity() {
                 n++
             }
             return n + (if (sawJoyCon) 1 else 0)
+        }
+
+        /**
+         * Runs an arcade game (.acgame): its files found and its dongle put in place first (Arcade),
+         * and anything that keeps it from starting said over the library, not only in the log. An
+         * arcade game has more of those than a disc: the dongle, the board's BIOS, the media.
+         */
+        private fun runArcadeGame(path: String) {
+            val ctx = instance?.applicationContext ?: return
+            val launch = com.armsx2.arcade.Arcade.prepare(ctx, path).getOrElse {
+                println("@@ANDROID_ARCADE@@ not started: $it")
+                com.armsx2.arcade.Arcade.notice.value = it.message ?: it.toString()
+                return
+            }
+            println("@@ANDROID_ARCADE@@ ${launch.game.gameId} mode=${launch.mode} elf=${launch.elf.take(200)} media=${launch.media.take(200)}")
+            NativeApp.setArcadeLaunchFiles(launch.elf, launch.media, launch.sram)
+            com.armsx2.arcade.Arcade.sessionMode.intValue = launch.mode
+            com.armsx2.arcade.Arcade.sessionGameId.value = launch.game.gameId
+            // The player's own layout for this game's cabinet (Arcade controls), before any press arrives.
+            com.armsx2.arcade.ArcadeControls.apply(launch.game.gameId)
+            try {
+                // The game's .acgame, or for a game kept as its own files the one written for it.
+                NativeApp.runVMThread(launch.manifest)
+            } finally {
+                com.armsx2.arcade.Arcade.sessionMode.intValue = -1
+                com.armsx2.arcade.Arcade.sessionGameId.value = null
+                com.armsx2.arcade.ArcadeControls.apply(null)
+            }
+            runCatching { NativeApp.getLastBootError() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { error ->
+                com.armsx2.arcade.Arcade.notice.value = com.armsx2.i18n.I18n.get("arcade.error.boot").format(error)
+            }
         }
 
         /**
@@ -951,6 +987,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (ctx != null) pickedId?.let { id ->
                     com.armsx2.CustomDriver.listInstalled(ctx).firstOrNull { it.id == id }
                 } else null
+            // Turnip options (#719) go into the environment before the device is created.
+            com.armsx2.CustomDriver.applyDriverEnv()
             if (ctx != null) com.armsx2.CustomDriver.applyToNative(ctx, picked)
             when (renderer.value) {
                 "vulkan" -> NativeApp.renderVulkan()
@@ -972,8 +1010,9 @@ open class MainActivityRuntime : ComponentActivity() {
             // already pushed [USB1] Type + the live attach (usbApplyPorts).
             usbKeyboardActive = resolved.system.usbKeyboard
             // A Cal armed in the previous game must not turn this one's first shot into a
-            // calibration shot.
+            // calibration shot, nor a pressure modifier toggled on (#304) soften its first press.
             com.armsx2.input.Lightgun.calibrateNext.value = false
+            com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = false
 
             // Neutralize the NATIVE pad analog deadzone before the VM loads [Pad1].
             // A stale [Pad1]/Deadzone in an existing config (from the old, non-saving
@@ -1016,7 +1055,11 @@ open class MainActivityRuntime : ComponentActivity() {
                 // 8 slots on for a complete pair of taps; idle slots are harmless (games
                 // ignore unused pads). Unconditional-when-ON so a pad joining after boot
                 // still lands on a live slot; the Pad-tab toggle covers mid-session enable.
-                if (ControllerMappings.multitapEnabled()) {
+                // This game's own value if it has one (currentGame is set by now), else global;
+                // the router follows it, so routing and the armed ports agree for this game.
+                val multitap = ControllerMappings.multitapEnabled()
+                com.armsx2.input.PadRouter.multitapEnabled = multitap
+                if (multitap) {
                     NativeApp.setSetting("Pad", "MultitapPort1", "bool", "true")
                     NativeApp.setSetting("Pad", "MultitapPort2", "bool", "true")
                     for (s in 2..8) {
@@ -1025,6 +1068,16 @@ open class MainActivityRuntime : ComponentActivity() {
                         NativeApp.setSetting("Pad$s", "AxisScale", "float", "1.33")
                         NativeApp.setSetting("Pad$s", "ButtonDeadzone", "float", "0")
                     }
+                } else {
+                    // Off has to be written as well. These flags live in the settings file, and
+                    // switching Multitap off with no game running never reaches the core
+                    // (setMultitap needs a VM), so a tap armed once stayed plugged in on every
+                    // later boot. A game that looks for a multitap then found one on port 1 and
+                    // took its players from there, never from port 2 where the second
+                    // controller plays: Marvel Ultimate Alliance and Sonic Riders (#586).
+                    NativeApp.setSetting("Pad", "MultitapPort1", "bool", "false")
+                    NativeApp.setSetting("Pad", "MultitapPort2", "bool", "false")
+                    for (s in 3..8) NativeApp.setSetting("Pad$s", "Type", "string", "None")
                 }
             }
 
@@ -1851,6 +1904,52 @@ open class MainActivityRuntime : ComponentActivity() {
             }
         }
 
+        /**
+         * Puts the APK's resources in the data folder for the core (shaders, the GameDB, fonts,
+         * fullscreenui, patches.zip, the controller DB, at <data folder>/resources), and on a new install
+         * of the app drops the regenerable GPU caches. Off the main thread, before the core starts.
+         *
+         * The files kept in step with the APK are rewritten only when this install has not written them
+         * yet: the marker beside them names the install that did, and is written after a clean pass, so a
+         * failed one is retried at the next launch. A data folder two installs share (stable and nightly)
+         * gets the files of whichever started last.
+         */
+        private fun ComponentActivity.prepareDataFolder() {
+            val info = runCatching { packageManager.getPackageInfo(packageName, 0) }.getOrNull()
+            val install = "$packageName ${BuildConfig.VERSION_CODE} ${BuildConfig.VERSION_NAME} ${info?.lastUpdateTime}"
+            val root = assetCopyRoot(applicationContext)
+
+            val shipped = File(File(root, "resources"), ".install")
+            MainActivity.refreshShippedAssets = runCatching { shipped.readText() }.getOrNull() != install
+            MainActivity.copyFailures = 0
+            copyAssetAll(applicationContext, "resources")
+            if (MainActivity.refreshShippedAssets && MainActivity.copyFailures == 0)
+                runCatching { shipped.writeText(install) }
+
+            // On any new install of the app, drop the regenerable GPU caches. The native caches carry
+            // their own build and driver stamps and discard themselves on a mismatch; this is the second
+            // line, for anything an older build wrote before those stamps existed. The marker lives in
+            // the data root beside the caches, not in this package's preferences: a data root shared by
+            // two installs (stable and nightly) is wiped whenever the other one last used it, and a
+            // data root that moved is wiped where it now is. lastUpdateTime changes on every install,
+            // so a rebuilt APK with an unchanged versionCode counts too. The marker is written only
+            // after the wipe succeeded, so a failed wipe is retried on the next launch.
+            runCatching {
+                val cacheDir = File(root, "cache")
+                val marker = File(cacheDir, ".install")
+                val recorded = runCatching { marker.readText() }.getOrNull()
+                if (recorded != install) {
+                    val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
+                    if (wiped && cacheDir.mkdirs()) {
+                        marker.writeText(install)
+                        android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
+                    } else {
+                        android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
+                    }
+                }
+            }
+        }
+
         private fun sameFilePath(a: File, b: File): Boolean {
             val ca = runCatching { a.canonicalFile }.getOrDefault(a.absoluteFile)
             val cb = runCatching { b.canonicalFile }.getOrDefault(b.absoluteFile)
@@ -2048,37 +2147,10 @@ open class MainActivityRuntime : ComponentActivity() {
             kr.co.iefriends.pcsx2.NativeApp.setAutoRendererGpuStrings(gl.vendor, gl.renderer, gl.version)
         }
 
-        // Default resources — shaders, GameIndex, fonts, fullscreenui,
-        // patches.zip, controller DB. assetCopyRoot resolves to the
-        // user's chosen systemDir (now valid post-setup) so emucore
-        // finds them at <systemDir>/resources/...
-        copyAssetAll(applicationContext, "bios")
-        copyAssetAll(applicationContext, "resources")
-
-        // On any new install of the app, drop the regenerable GPU caches. The native caches carry
-        // their own build and driver stamps and discard themselves on a mismatch; this is the second
-        // line, for anything an older build wrote before those stamps existed. The marker lives in
-        // the data root beside the caches, not in this package's preferences: a data root shared by
-        // two installs (stable and nightly) is wiped whenever the other one last used it, and a
-        // data root that moved is wiped where it now is. lastUpdateTime changes on every install,
-        // so a rebuilt APK with an unchanged versionCode counts too. The marker is written only
-        // after the wipe succeeded, so a failed wipe is retried on the next launch.
-        runCatching {
-            val info = packageManager.getPackageInfo(packageName, 0)
-            val install = "$packageName ${BuildConfig.VERSION_CODE} ${BuildConfig.VERSION_NAME} ${info.lastUpdateTime}"
-            val cacheDir = File(assetCopyRoot(applicationContext), "cache")
-            val marker = File(cacheDir, ".install")
-            val recorded = runCatching { marker.readText() }.getOrNull()
-            if (recorded != install) {
-                val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
-                if (wiped && cacheDir.mkdirs()) {
-                    marker.writeText(install)
-                    android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
-                } else {
-                    android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
-                }
-            }
-        }
+        // The shipped resources and the GPU cache wipe after a new install are written into the data folder
+        // at the start of the background block below (prepareDataFolder), before the core starts: here, on
+        // the main thread, they held up the first screen long enough on an SD card for Android to report
+        // the app as not responding.
 
         // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
         // GS thread ever opens a GL context. Re-applied per launch below too.
@@ -2111,6 +2183,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // cosmetic and must not block first paint / risk an ANR on slow SD cards.)
 
         invoke {
+            prepareDataFolder()
             NativeApp.initializeOnce(applicationContext)
             nativeReady.value = true
 
@@ -2121,6 +2194,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.input.Lightgun.load()
                 com.armsx2.input.UsbDevices.applyAtBoot()
             }
+            // The Overlay tab's switch for the free-software notice at game start (#453).
+            runCatching { NativeApp.setFreeSoftwareNotice(prefs.getBoolean("ui.freeSoftwareNotice", true)) }
 
             // Pin Filenames/BIOS to the file the setup wizard copied —
             // deferred to here because Host::SetBaseStringSettingValue
@@ -2141,6 +2216,8 @@ open class MainActivityRuntime : ComponentActivity() {
                     NativeApp.commitSettings()
                 }
             }
+            // The arcade games' BIOS is never picked: each game starts with one it runs on (Arcade.forgetArcadeBiosPick).
+            runCatching { com.armsx2.arcade.Arcade.forgetArcadeBiosPick() }
 
             // Mirror the canonical (app-private) BIOS into the user's data root at
             // <dataRoot>/bios so it's visible/backup-able next to cache/covers/etc.
@@ -2401,6 +2478,7 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.EnglishTitles.load()
         com.armsx2.CustomNames.load()
         com.armsx2.HiddenGames.load()
+        com.armsx2.ArcadeOnly.load()
         com.armsx2.LibraryTitles.load()
         com.armsx2.LibraryRecentShelf.load()
         // Discord needs an Activity to launch its sign-in browser and has no other way to obtain
@@ -2543,6 +2621,13 @@ open class MainActivityRuntime : ComponentActivity() {
         // before any game runs. Referencing NativeApp also loads the native lib (static init).
         runCatching { kr.co.iefriends.pcsx2.NativeApp.setAdpfEnabled(prefs.getBoolean("ui.adpf", false)) }
 
+        // Arcade holds Compose state the first frame reads (its launch notice), and the emucore
+        // init below reaches it first, from its own thread (forgetArcadeBiosPick). A state made on another
+        // thread while a composition is running cannot be read by that composition: the first frame
+        // threw "Reading a state that was created after the snapshot was taken" and the app could
+        // not open. So it is made here, on the main thread, before either of them starts.
+        com.armsx2.arcade.Arcade.forgetArcadeBiosPick()
+
         // Defer asset copy + emucore init until setup is complete. On the
         // first-ever run, `systemDir` isn't picked yet at onCreate time —
         // so initializeOnce would resolve to the app-private fallback and
@@ -2604,6 +2689,8 @@ open class MainActivityRuntime : ComponentActivity() {
             if (com.armsx2.BuildConfig.IN_APP_UPDATER) {
                 com.armsx2.update.AutoUpdateGate()
             }
+            // Why an arcade game did not start, when it did not.
+            com.armsx2.arcade.ArcadeNotice()
             // First-time setup deferral: when the wizard finishes and
             // setupComplete flips to true, kick off the heavy emucore
             // init now that `MainActivityRuntime.systemDir` reflects the user's pick.
@@ -3045,13 +3132,12 @@ open class MainActivityRuntime : ComponentActivity() {
         }
     }
 
-    // Physical buttons currently held down. Drives two-button hotkey combos
-    // (e.g. Select + R1) — kept current at the top of dispatchKeyEvent so a
-    // combo's modifier can be checked the instant its main key is pressed.
     private val heldKeys = HashSet<Int>()
+    private val gameplayHotkeyKeysDown = HashSet<Int>()
     private val fastForwardHold = HotkeyHoldState()
 
-    private fun startFastForwardHold(mainKey: Int) {
+    private fun startFastForwardHold() {
+        val mainKey = ControllerMappings.hotkeyCode(ControllerMappings.SysHotkey.FAST_FORWARD)
         val modifier = ControllerMappings.hotkeyModCode(ControllerMappings.SysHotkey.FAST_FORWARD)
             .takeUnless { it == KeyEvent.KEYCODE_UNKNOWN }
         fastForwardHold.start(mainKey, modifier)
@@ -3086,6 +3172,9 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The library screensaver sees every key first: any input resets its clock, and the press
+        // that wakes it goes no further, so it can't also start a game.
+        if (com.armsx2.ui.home.LibraryScreensaver.onKey(event)) return true
         // Joy-Con buttons all arrive as KEYCODE_UNKNOWN (no Android key layout for 0x057E,
         // so keyCode is always 0 — emulog-150). Rewrite to a stable scanCode-derived keycode
         // ONCE here and re-dispatch, so EVERY downstream path — bind-capture, nav, AND the
@@ -3208,6 +3297,9 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.common.PadModals.visible &&
             !com.armsx2.ui.home.LibraryKeyboard.visible.value
         ) {
+            // Except the phone's own volume keys, which are the system's with a modal up or not:
+            // swallowing them left the volume stuck while any menu or prompt was open.
+            if (isVolumeKey(kc)) return false
             val firstDown = event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0
             when (kc) {
                 KeyEvent.KEYCODE_DPAD_UP -> if (firstDown) modalNavMove(0, -1)
@@ -3313,6 +3405,8 @@ open class MainActivityRuntime : ComponentActivity() {
         // pads that report the D-pad as KEYCODE_DPAD_*. Placed before every other
         // frontend handler so nothing leaks to the grid behind it.
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
+            // The phone's volume keys stay the system's, as they are with any modal up.
+            if (isVolumeKey(kc)) return false
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3335,6 +3429,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // selection, A jumps to the setting, Y re-opens the keyboard, B closes. Owns the pad so
         // nothing leaks to the settings screen behind.
         if (com.armsx2.ui.settingshub.SettingsSearch.visible.value) {
+            if (isVolumeKey(kc)) return false // the system's, as with any modal up
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.settingshub.SettingsSearch.move(-1)
@@ -3356,6 +3451,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // block above on purpose: naming a preset hands input to LibraryKeyboard, and it
         // must keep it until it closes.
         if (com.armsx2.ui.common.ShaderParamsEditor.visible) {
+            // The phone's volume keys stay the system's: the catch-all below swallowed them, so
+            // the volume could not be changed while the editor was open.
+            if (isVolumeKey(kc)) return false
             val editor = com.armsx2.ui.common.ShaderParamsEditor
             val down = event.action == KeyEvent.ACTION_DOWN
             when (kc) {
@@ -3567,6 +3665,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
             }
             val matched = ControllerMappings.matchHotkey(kc, matchKeys)
+            if (!down && matched != null && gameplayHotkeyKeysDown.remove(kc))
+                dispatchGameplayKey(event)
             when (matched) {
                 // Pressure modifier is a hold, handled (and consumed) earlier in
                 // dispatchKeyEvent; it never reaches this one-shot action switch.
@@ -3627,6 +3727,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (down && event.repeatCount == 0) toggleGyro()
                     return true
                 }
+                ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> {
+                    if (down && event.repeatCount == 0) togglePressureModifier()
+                    return true
+                }
                 ControllerMappings.SysHotkey.GYRO_RECENTER -> {
                     if (down && event.repeatCount == 0) recenterGyro()
                     return true
@@ -3657,7 +3761,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     // current limiter mode (Nominal if frame-limit is on, else Unlimited)
                     // — not blindly Nominal, which would re-enable a disabled limiter.
                     // Release was handled above using the binding active at press time.
-                    if (down && event.repeatCount == 0) startFastForwardHold(kc)
+                    if (down && event.repeatCount == 0) startFastForwardHold()
                     return true
                 }
                 ControllerMappings.SysHotkey.FAST_FORWARD_TOGGLE -> {
@@ -3742,6 +3846,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     code, port, fromController,
                 )
             }
+            if (ControllerMappings.isHotkeyKeyOrModifier(physicalCode)) {
+                if (type == KeyEventType.KeyDown) gameplayHotkeyKeysDown.add(physicalCode)
+                else gameplayHotkeyKeysDown.remove(physicalCode)
+            }
             return true
         }
 
@@ -3773,6 +3881,10 @@ open class MainActivityRuntime : ComponentActivity() {
             handleTurbo(physicalCode, edge, target, port)
         } else {
             sendKeyAction(edge, target, port, fromController)
+        }
+        if (ControllerMappings.isHotkeyKeyOrModifier(physicalCode)) {
+            if (type == KeyEventType.KeyDown) gameplayHotkeyKeysDown.add(physicalCode)
+            else gameplayHotkeyKeysDown.remove(physicalCode)
         }
         return true
     }
@@ -3835,6 +3947,15 @@ open class MainActivityRuntime : ComponentActivity() {
         val on = !gyroActive.value
         gyroActive.value = on
         hotkeyToast(if (on) "Gyro ON" else "Gyro OFF")
+    }
+
+    /** The PRESSURE_MOD_TOGGLE hotkey (#304): flips the soft-press modifier and leaves it, applied
+     *  to buttons already held just as the hold binding does. */
+    private fun togglePressureModifier() {
+        val on = !com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value
+        com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = on
+        com.armsx2.ui.touch.TouchControls.reapplyPressureToHeldButtons()
+        hotkeyToast(if (on) "Pressure modifier ON" else "Pressure modifier OFF")
     }
 
     /** Re-zero the motion neutral. Routed through [gyroRecenterHook] because the sensor
@@ -4028,6 +4149,7 @@ open class MainActivityRuntime : ComponentActivity() {
     // on every other device — see maybeCorrectTouchScale). ALWAYS returns super, so it can never
     // block or consume a tap.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (com.armsx2.ui.home.LibraryScreensaver.onTouch(ev)) return true
         maybeCorrectTouchScale(ev)
         return super.dispatchTouchEvent(ev)
     }
@@ -4264,6 +4386,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (com.armsx2.ui.home.LibraryScreensaver.onMotion(ev)) return true
         // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
         // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
         // gameplay path would drop. Pure logging — no behaviour change.
@@ -4346,7 +4469,8 @@ open class MainActivityRuntime : ComponentActivity() {
             sendTrigger(ev, left = false, port = port)
             // Physical STICK DIRECTIONS bound to a PS2 control via the "(send)"
             // rows — e.g. R-Stick Down bound to send Square. The analog "(send)"
-            // targets contribute to the merge layer like every other writer.
+            // targets contribute to the merge layer like every other writer. A bound
+            // direction no longer drives its own stick direction too (dispatchStick).
             dispatchStickDirBindings(ev, port)
             // Single write per analog code per event, merged across ALL writers.
             flushAnalogAxes(port)
@@ -4364,6 +4488,11 @@ open class MainActivityRuntime : ComponentActivity() {
     // merge layer), thresholded for a digital one (change-tracked per code so we
     // only write edges, like dispatchDpadCombined).
     private val stickDirDigitalHeld = Array(8) { HashSet<Int>() } // per unified pad slot (multitap)
+
+    /** Whether this physical stick direction is bound to a PS2 control in Button mapping. */
+    private fun stickDirBound(left: Boolean, dir: ControllerMappings.StickDir, port: Int): Boolean =
+        ControllerMappings.targetForPhysical(ControllerMappings.stickHotkeyKeyCode(left, dir), port) != null
+
     private fun dispatchStickDirBindings(ev: MotionEvent, port: Int) {
         for (left in booleanArrayOf(true, false)) {
             // Same axis correction the main dispatch applies (swap, then inverts).
@@ -5165,7 +5294,8 @@ open class MainActivityRuntime : ComponentActivity() {
      *  user-chosen left for RE4-style games; steer -> left) so coarse stick aim
      *  and fine gyro adjustment work together instead of clobbering each other. */
     fun onGyroAnalog(mode: Int, gx: Float, gy: Float) {
-        gyroCombineLeft = mode == 2 ||
+        gyroCombineLeft =
+            (mode == 2 && ControllerMappings.gyroSteerStick() == ControllerMappings.GYRO_STICK_LEFT) ||
             (mode == 1 && ControllerMappings.gyroAimStick() == ControllerMappings.GYRO_STICK_LEFT)
         gyroVecX = gx; gyroVecY = gy
         gyroCombineActive = gx != 0f || gy != 0f
@@ -5205,6 +5335,14 @@ open class MainActivityRuntime : ComponentActivity() {
         if (ControllerMappings.stickSwapXY(leftStick)) { val t = vx; vx = vy; vy = t }
         if (ControllerMappings.stickInvertX(leftStick)) vx = -vx
         if (ControllerMappings.stickInvertY(leftStick)) vy = -vy
+        // A direction bound in Button mapping (a "(send)" row) drives only that binding, in
+        // dispatchStickDirBindings. Driving the stick's own direction as well sent both at once:
+        // swapping the right stick's left and right that way put R-Left and R-Right on the same
+        // axis together, and they cancelled out (#604).
+        if (vx < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.LEFT, port)) vx = 0f
+        if (vx > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.RIGHT, port)) vx = 0f
+        if (vy < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.UP, port)) vy = 0f
+        if (vy > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.DOWN, port)) vy = 0f
         when (mode) {
             ControllerMappings.StickMode.ANALOG -> {
                 // Radial shaping into the merge layer (flushAnalogAxes writes once
@@ -5333,6 +5471,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 hotkeyToast(if (on) "Fast Forward ON" else "Fast Forward OFF")
             }
             ControllerMappings.SysHotkey.GYRO_TOGGLE -> toggleGyro()
+            ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> togglePressureModifier()
             // GYRO_HOLD needs key up/down edges, which this edge-triggered path (stick
             // directions / combos) doesn't provide — behave as a toggle here rather than
             // latching gyro on with no release.
@@ -5540,6 +5679,7 @@ open class MainActivityRuntime : ComponentActivity() {
      * L2/R2 alone so nothing else changes; the owner is dropped on its release.
      */
     private val triggerHotkeyOwner = HashMap<Int, Boolean>()
+    private val triggerPadTargets = Array(8) { HashMap<Int, Int>() }
 
     private fun sendTrigger(event: MotionEvent, left: Boolean, port: Int) {
         // -1 = no trigger axis on this side; its L2/R2 is a key event, key path owns it.
@@ -5576,7 +5716,7 @@ open class MainActivityRuntime : ComponentActivity() {
             if (ours) ControllerMappings.matchHotkey(code, if (pressed) heldKeys else heldKeys + code)?.let { hk ->
                 when (hk) {
                     ControllerMappings.SysHotkey.FAST_FORWARD -> {
-                        if (pressed) startFastForwardHold(code)
+                        if (pressed) startFastForwardHold()
                     }
                     ControllerMappings.SysHotkey.PRESSURE_MOD ->
                         com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = pressed
@@ -5595,7 +5735,14 @@ open class MainActivityRuntime : ComponentActivity() {
         // A trigger bound to a hotkey or a macro doesn't also drive the pad — the precedence
         // the key path and emitCustom already apply. The hotkey match is combo-aware, so a
         // trigger that is merely a MODIFIER keeps working as L2/R2.
-        if (ControllerMappings.matchHotkey(code, heldKeys) != null) return
+        val hotkeyKeys = if (pressed) heldKeys else heldKeys + code
+        if (ControllerMappings.matchHotkey(code, hotkeyKeys) != null) {
+            triggerPadTargets[port].remove(code)?.let { target ->
+                if (target in 110..123) accumAnalog(target, 0f)
+                else NativeApp.setPadButtonForPort(port, target, 0, false)
+            }
+            return
+        }
         if (com.armsx2.ui.touch.TouchControls.macroForPhysicalCode(code) != null) return
 
         // Honor the L2/R2 binding: triggers arrive as motion axes, never through the
@@ -5619,6 +5766,8 @@ open class MainActivityRuntime : ComponentActivity() {
             // and whether [shapeTrigger] applied a curve — never this write itself.
             NativeApp.setPadButtonForPort(port, target, (out * 32767).toInt(), out > 0f)
         }
+        if (out > 0f) triggerPadTargets[port][code] = target
+        else triggerPadTargets[port].remove(code)
     }
 
     /** Set in onPause when the screen goes off (a real sleep), consumed in onResume so the sleep

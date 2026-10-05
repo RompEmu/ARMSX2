@@ -250,6 +250,65 @@ public class NativeApp {
 
 	/** Press/release one GUNCON_* binding on a port. */
 	public static native void usbLightgunButton(int port, int bind, boolean pressed);
+
+	// ---- Namco System 246/256 arcade games (.acgame) ----------------------------
+	/** Cabinet controls, from the core's JVS_MODE (pcsx2/DEV9/ACJV.h). */
+	public static final int ARCADE_MODE_GENERIC = 0;
+	public static final int ARCADE_MODE_LIGHTGUN = 1;
+	public static final int ARCADE_MODE_FIGHTING = 2;
+	public static final int ARCADE_MODE_RACING = 3;
+	public static final int ARCADE_MODE_DRUM = 4;
+	public static final int ARCADE_MODE_TOUCH = 5;
+	public static final int ARCADE_MODE_STANDARD = 6;
+	public static final int ARCADE_MODE_TWINSTICK = 7;
+
+	/**
+	 * Where the files an .acgame names were found (boot ELF, media image, SRAM file), as paths or
+	 * content:// URIs, for the next runVMThread only. A null or empty one is looked for next to the
+	 * .acgame, which only works for a plain path.
+	 */
+	public static native void setArcadeLaunchFiles(String elf, String media, String sram);
+
+	/** Why the last runVMThread could not boot, or "" when it did. */
+	public static native String getLastBootError();
+
+	/** The cabinet controls (ARCADE_MODE_*) the core gives a game ID such as NM00004. */
+	public static native int arcadeModeForGameId(String gameId);
+
+	/** Whether the running game is an arcade one. */
+	public static native boolean isArcadeSession();
+
+	/** A coin in player 1's (0) or player 2's (1) slot. */
+	public static native void arcadeInsertCoin(int player);
+
+	/** Holds or lets go of the cabinet's Service button. */
+	public static native void arcadeService(boolean pressed);
+
+	/** Flips the board's Test switch (the game's test menu). */
+	public static native void arcadeToggleTest();
+
+	/** Whether the Test switch is on. */
+	public static native boolean arcadeTestModeOn();
+
+	/** Whether a BIOS file is an arcade board's (COH-H). */
+	public static native boolean isArcadeBios(String path);
+
+	/** The board whose BIOS the arcade game needs when none of the arcade BIOS files there runs it
+	 *  ("System 246" for Battle Gear 3, which rejects the System 256 one), else "": the core's choice at boot. */
+	public static native String getArcadeBiosNeed(String gameId);
+
+	/** The jobs the pad's buttons do on an arcade game's cabinet, for the Arcade controls settings:
+	 *  "mode\tN" first, then a job a line (name, default pad keys, fixed), as native-lib.cpp says. */
+	public static native String getArcadeControls(String gameId);
+
+	/** The player's own layout for the arcade game being played: pairs of pad keys (a button, then the
+	 *  button whose job it does, -1 for none). Null or empty: the cabinet's own layout. */
+	public static native void setArcadeRemap(int[] pairs);
+
+	/** Every arcade game the database knows, one per line: game ID, name, board (System246,
+	 *  System256 or System SUPER256) and media (CD, DVD or HDD), tab separated. */
+	public static native String getArcadeGames();
+
 	public static native String getGameTitle(String path);
 	public static native String getGameSerial();
 	public static native String getGameCRC();
@@ -468,6 +527,9 @@ public class NativeApp {
 	 *  unplug what they no longer name. Called after Settings.applyTo writes [USB1] Type
 	 *  for the keyboard switch; a no-op with no VM running. */
 	public static native void usbApplyPorts();
+
+	/** Show the free-software notice when a game boots (#453). On by default. */
+	public static native void setFreeSoftwareNotice(boolean show);
 	/** Feed one Android hardware {@link android.view.KeyEvent} to the emulated USB
 	 *  keyboard on {@code port}. {@code androidKeyCode} is {@code KeyEvent.keyCode};
 	 *  {@code pressed} is the down/up state. Returns {@code true} iff a USB keyboard
@@ -1031,6 +1093,11 @@ public class NativeApp {
 	}
 
 	// Call jni
+	public static String[] findSiblingChds(String uriString) {
+		Context context = getContext();
+		return context != null ? ContentChdFiles.findSiblings(context.getContentResolver(), Uri.parse(uriString)) : new String[0];
+	}
+
 	public static int openContentUri(String uriString) {
 		Context _context = getContext();
 		if(_context != null) {

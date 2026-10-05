@@ -17,6 +17,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_framebuffer_fetch_policy_tests.cpp
 	gs_draw_road_tests.cpp
 	gs_date_road_tests.cpp
+	gs_alpha_bit_logic_op_tests.cpp
 	gs_copy_road_blending_tests.cpp
 	gs_native_texel_grid_tests.cpp
 	gs_self_read_road_tests.cpp
@@ -25,6 +26,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_stream_ring_flush_tests.cpp
 	gs_stream_ring_growth_tests.cpp
 	gs_gpu_driver_profile_tests.cpp
+	gs_driver_report_tests.cpp
 	gs_vulkan_device_rules_tests.cpp
 	gs_gpu_profile_tests.cpp
 	gs_draw_staging_tests.cpp
@@ -50,6 +52,9 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_stq_blit_tests.cpp
 	gs_sw_coordinate_field_tests.cpp
 	gs_sw_coordinate_grain_tests.cpp
+	gs_sw_sprite_ramp_tests.cpp
+	gs_sw_perspective_plane_tests.cpp
+	gs_sw_perspective_plane_scanline_tests.cpp
 	gs_sw_scanline_lod_tests.cpp
 	gs_sw_textured_block_width_tests.cpp
 	gs_sw_depth_walk_tests.cpp
@@ -68,6 +73,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_null_device_profile_tests.cpp
 	gs_sw_texture_dirty_tests.cpp
 	gs_blend_constant_policy_tests.cpp
+	gs_over_one_two_pass_tests.cpp
 	gs_autoflush_engine_level_tests.cpp
 	gs_draw_buffer_overlap_tests.cpp
 	gs_ktx_tests.cpp
@@ -75,6 +81,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_texture_cache_move_tests.cpp
 	gs_dither_scale_tests.cpp
 	gs_cull_grid_refresh_tests.cpp
+	gs_split_seam_tests.cpp
 	gs_cull_grid_native_target_tests.cpp
 	gs_point_safe_features_tests.cpp
 	gs_field_shift_detector_tests.cpp

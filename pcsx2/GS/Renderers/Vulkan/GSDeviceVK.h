@@ -65,6 +65,9 @@ public:
 		/// alternative is recreating the device when frame generation is switched on.
 		bool vk_khr_vulkan_memory_model : 1;   ///< shaders declare the Vulkan memory model
 		bool vk_ext_robustness2_null_descriptor : 1; ///< nullDescriptor only; not the robust-access bits
+		/// shaderFloat16, for LSFG's half-precision shaders. Unlike the two above it is asked for
+		/// only while GSConfig.LsfgFp16 is on, so nobody else's device changes.
+		bool vk_khr_shader_float16_int8 : 1;
 		bool vk_ext_device_fault : 1;
 	};
 
@@ -452,6 +455,13 @@ private:
 	OptionalExtensions m_optional_extensions = {};
 	bool m_colorclip_fallback_to_hdr = false;
 
+	// For the driver report written beside a GS dump: what the device was created with and the
+	// self-read road CheckFeatures chose. Recorded only; nothing reads them to decide anything.
+	std::vector<std::string> m_enabled_device_extensions;
+	std::vector<std::string> m_missing_device_extensions;
+	std::string m_report_self_read_road;
+	bool m_report_declare_depth_loop = false;
+
 	u32 m_max_framebuffer_width = 0;
 	u32 m_max_framebuffer_height = 0;
 public:
@@ -495,6 +505,7 @@ public:
 				u32 ds : 1;
 				u32 line_width : 1;
 				u32 feedback_loop_flags : 3;
+				u32 raster_order : 1;
 			};
 
 			u32 key;
@@ -818,6 +829,13 @@ public:
 	__fi VkSampler GetPointSampler() const { return m_point_sampler; }
 	__fi VkSampler GetLinearSampler() const { return m_linear_sampler; }
 
+	/// What frame generation needs to draw the ImGui overlay onto its generated frames the way
+	/// RenderImGui draws it onto the real one.
+	__fi VkPipeline GetImGuiPipeline() const { return m_imgui_pipeline; }
+	__fi VkPipelineLayout GetUtilityPipelineLayout() const { return m_utility_pipeline_layout; }
+	__fi VkDescriptorSetLayout GetUtilityDescriptorSetLayout() const { return m_utility_ds_layout; }
+	__fi bool UsesPushDescriptors() const { return m_use_push_descriptors; }
+
 	RenderAPI GetRenderAPI() const override;
 	bool HasSurface() const override;
 
@@ -829,6 +847,7 @@ public:
 	bool SupportsExclusiveFullscreen() const override;
 	void DestroySurface() override;
 	std::string GetDriverInfo() const override;
+	void CollectDriverReport(GSDriverReport::BackendReport& out) const override;
 
 	void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle) override;
 
@@ -1053,6 +1072,26 @@ private:
 	//     kick switch itself off partway through every frame at nobody's request.
 	// ~0u = no readback seen yet, window shut.
 	u32 m_render_passes_since_submit = 0;
+
+	/// Render passes ended so far; a stencil copy belongs to the pass it was built in.
+	u64 m_render_pass_serial = 0;
+
+	/// GSAlphaBitLogicOp: the destination-alpha stencil copy that DATE draws with
+	/// GSHWDrawConfig::date_copy share, while it stays true. Valid only inside the pass it was
+	/// built in, for these targets and this DATM.
+	struct DateCopy
+	{
+		bool valid = false;
+		const GSTexture* rt = nullptr;
+		const GSTexture* ds = nullptr;
+		SetDATM datm = SetDATM::DATM0;
+		u64 pass_serial = 0;
+	};
+	DateCopy m_date_copy;
+	/// The next DeclareDrawFeedbackLoop declares the colour loop although the draw does not read (see
+	/// the shared DATE copy's setup in DoRenderHW).
+	bool m_declare_rt_loop_without_read = false;
+	bool DateCopyLive(const GSHWDrawConfig& config);
 	u32 m_readback_frame = ~0u;
 	// The kick's spacing, in unsubmitted render passes (see DoRenderHW). Only gsrunner's
 	// -readback-kick-passes moves it.

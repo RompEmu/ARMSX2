@@ -516,7 +516,7 @@ private fun MenuTab(tab: EmulationMenuTab, active: Boolean, onSelect: (Emulation
 }
 
 // Rail tab icons. No monochrome Unicode exists for gamepad/wrench/trophy/display, so those
-// use color emoji (the bundled NotoColorEmoji renders them); Session keeps its clean text
+// use color emoji (Android's own emoji font draws them); Session keeps its clean text
 // glyph. Performance uses the high-voltage emoji so it reads as a yellow lightning bolt.
 // Options carries the settings gear; the full-settings shortcut below the rail divider uses
 // a distinct "open" glyph so there aren't two gears.
@@ -666,6 +666,7 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
                 android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
                 viewModel.resume()
             },
+        ) + arcadeActions(viewModel) + listOf(
             MenuAction(str("action.close"), MainActivityRuntime.currentGame.value?.title.orEmpty(), "■", Danger) {
                 MainActivityRuntime.closeGame()
             },
@@ -865,15 +866,15 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     }
     // GS Multi-threading (GV7 front/back split). Restart-required like the renderer /
     // driver above, so it lives in the same group — hit Apply & Restart below to apply.
-    // Off = single-threaded; On = GS on a dedicated back thread (Pipelined, enum 3).
-    // The Inline/Lockstep dev rungs are not exposed. Description shown inline so users
-    // who never open full settings still understand what it does.
+    // Off (0) = single-threaded; on (any other value, written as 1) = GS rendering on a
+    // second thread. Description shown inline so users who never open full settings
+    // still understand what it does.
     MenuSwitchRow(
         str("renderer.gsBackThread.label"),
-        settings.display.gsBackThreadMode >= 3,
+        settings.display.gsBackThreadMode != 0,
         description = str("renderer.gsBackThread.description"),
     ) { on ->
-        viewModel.updateSettings { it.copy(display = it.display.copy(gsBackThreadMode = if (on) 3 else 0)) }
+        viewModel.updateSettings { it.copy(display = it.display.copy(gsBackThreadMode = if (on) 1 else 0)) }
     }
     // Coalesce Render Passes is deliberately NOT here. It only helps Dirge of Cerberus, and the
     // game database already turns it on for Dirge, so it lives in All Settings > Renderer >
@@ -978,6 +979,23 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         ),
         selected = settings.output.aspectRatio,
         onSelect = viewModel::setAspectRatio,
+    )
+    // Screen orientation from in-game: whether a game plays better in portrait or landscape is
+    // found out by trying it, and that meant leaving for All Settings each time. Same values as
+    // the Renderer tab's row, and applied straight away the same way.
+    HorizontalOptions(
+        title = str("renderer.orientation.label"),
+        options = listOf(
+            0 to str("renderer.orientation.device"),
+            1 to str("renderer.orientation.landscape"),
+            2 to str("renderer.orientation.portrait"),
+            3 to str("renderer.orientation.autoRotate"),
+        ),
+        selected = settings.output.orientation.coerceIn(0, 3),
+        onSelect = { value ->
+            viewModel.updateSettings { it.copy(output = it.output.copy(orientation = value)) }
+            MainActivityRuntime.instance?.applyEmulationOrientation()
+        },
     )
     // Overlay artwork, switchable from in-game — trying bezels means seeing them ON the game, and
     // having to leave for All Settings each time made that unusable. Import still lives in the
@@ -1221,9 +1239,10 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
         multiplier = settings.graphics.lsfgMultiplier,
         dllPath = settings.graphics.lsfgDllPath,
         performance = settings.graphics.lsfgPerformance,
+        fp16 = settings.graphics.lsfgFp16,
         flowScale = settings.graphics.lsfgFlowScale,
         targetRate = settings.graphics.lsfgTargetRate,
-    ) { on, mult, dll, perf, flow, target ->
+    ) { on, mult, dll, perf, flow, target, half ->
         viewModel.updateSettings {
             it.copy(
                 graphics = it.graphics.copy(
@@ -1231,6 +1250,7 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
                     lsfgMultiplier = mult,
                     lsfgDllPath = dll,
                     lsfgPerformance = perf,
+                    lsfgFp16 = half,
                     lsfgFlowScale = flow,
                     lsfgTargetRate = target,
                 ),
@@ -1343,6 +1363,9 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // Sits with the touch layout because it's the same job: what the on-screen pad LOOKS
     // like, right after where it's laid out. Full-screen like Controller mapping.
     CompactAction(str("tab.skins"), "◈", Modifier.fillMaxWidth(), viewModel::openSkins)
+    Spacer(Modifier.height(6.dp))
+    // Hotkeys, under Skins: All Settings' Hotkeys page, opened straight over the game.
+    CompactAction(str("tab.hotkeys"), "⌘", Modifier.fillMaxWidth(), viewModel::openHotkeys)
     // Analog sticks in-game: swap/invert per stick, deadzone and feel. Requested because some
     // games ship no invert option of their own, so changing it meant leaving the game for All
     // Settings mid-session (Sizor). Global scope, matching the rumble/multitap toggles above.
@@ -1357,6 +1380,8 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // Macros — edit each M1-M4 button set here in-game too (physical-trigger binding stays
     // in All Settings › Controls, which hosts the key-capture listener).
     com.armsx2.ui.settings.MacrosSection()
+    // Arcade controls for the arcade game being played: what each button does on its cabinet.
+    com.armsx2.arcade.Arcade.sessionGameId.value?.let { com.armsx2.ui.settings.ArcadeControlsSection(it, pickGame = false) }
 }
 
 @Composable
@@ -1554,6 +1579,33 @@ private fun HardcoreBadge() {
     }
 }
 
+/**
+ * The arcade cabinet's own buttons, while an arcade game runs: coins, Service and the Test switch.
+ * Each goes back to the game, which only sees a press it is running for.
+ */
+@Composable
+private fun arcadeActions(viewModel: EmulationMenuViewModel): List<MenuAction> {
+    if (com.armsx2.arcade.Arcade.sessionMode.intValue < 0) return emptyList()
+    return listOf(
+        MenuAction(str("arcade.coin.p1"), str("arcade.coin.p1.detail"), "¢", null) {
+            com.armsx2.arcade.Arcade.insertCoin(0)
+            viewModel.resume()
+        },
+        MenuAction(str("arcade.coin.p2"), str("arcade.coin.p2.detail"), "¢", null) {
+            com.armsx2.arcade.Arcade.insertCoin(1)
+            viewModel.resume()
+        },
+        MenuAction(str("arcade.service"), str("arcade.service.detail"), "✚", null) {
+            viewModel.resume()
+            com.armsx2.arcade.Arcade.pressService()
+        },
+        MenuAction(str("arcade.test"), str("arcade.test.detail"), "⚙", null) {
+            com.armsx2.arcade.Arcade.toggleTest()
+            viewModel.resume()
+        },
+    )
+}
+
 private data class MenuAction(
     val title: String,
     val detail: String,
@@ -1734,8 +1786,6 @@ private fun MenuSwitchRow(
             .controllerFocusable(
                 "pause.switch.$title",
                 onConfirm = { if (enabled) onCheckedChange(!checked) },
-                onLeft = { if (enabled) onCheckedChange(false) },
-                onRight = { if (enabled) onCheckedChange(true) },
             ),
         enabled = enabled,
         shape = RoundedCornerShape(16.dp),

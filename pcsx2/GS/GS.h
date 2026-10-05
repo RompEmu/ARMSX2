@@ -112,6 +112,9 @@ bool GSIsDumpRecording();
 // Not the same question as the BackThreadMode setting, which downgrades to lockstep when the
 // split is unsupported, so this is the only way to tell whether the mode really engaged.
 bool GSHasFrontParser();
+// Waits until the GS back thread has executed every queued record. MTGS thread only. No-op with
+// GS multi-threading off.
+void GSDrainBackQueue();
 void GSStopGSDump();
 void GSPresentCurrentFrame();
 void GSThrottlePresentation();
@@ -151,6 +154,8 @@ void GSgetTitleStats(std::string& info);
 /// Converts window position to normalized display coordinates (0..1). A value less than 0 or greater than 1 is
 /// returned if the position lies outside the display area.
 void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float* display_x, float* display_y);
+void GSTranslateWindowToDisplayCoordinatesUnclamped(float window_x, float window_y, float* display_x, float* display_y);
+void GSTranslateDisplayToWindowCoordinates(float display_x, float display_y, float* window_x, float* window_y);
 
 void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
 void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);

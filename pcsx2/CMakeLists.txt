@@ -302,6 +302,17 @@ set(pcsx2SPU2Headers
 
 # DEV9 sources
 set(pcsx2DEV9Sources
+	# Namco System 246/256 arcade board (PCSX2x6); only reached during an arcade session
+	DEV9/ACATA.cpp
+	DEV9/ACATA_IO.cpp
+	DEV9/ACATA_IO_CHD.cpp
+	DEV9/ACATAPI.cpp
+	DEV9/ACCORE.cpp
+	DEV9/ACJV.cpp
+	DEV9/ACRAM.cpp
+	DEV9/ACSRAM.cpp
+	DEV9/ACUART.cpp
+	DEV9/ACUART_GLUE.cpp
 	DEV9/AdapterUtils.cpp
 	DEV9/ATA/Commands/ATA_Command.cpp
 	DEV9/ATA/Commands/ATA_CmdDMA.cpp
@@ -360,6 +371,21 @@ endif()
 
 # DEV9 headers
 set(pcsx2DEV9Headers
+	DEV9/ACATA.h
+	DEV9/ACATA_CMD_RESPONSES
+	DEV9/ACATA_internal.h
+	DEV9/ACATA_IO_CHD.h
+	DEV9/ACATA_IO_WRITES.h
+	DEV9/ACATAPI.h
+	DEV9/ACCORE.h
+	DEV9/ACDEV.h
+	DEV9/ACJV.h
+	DEV9/ACJV_Inputs.h
+	DEV9/ACMACROS.h
+	DEV9/ACRAM.h
+	DEV9/ACSRAM.h
+	DEV9/ACUART.h
+	DEV9/ACUART_GLUE.h
 	DEV9/AdapterUtils.h
 	DEV9/ATA/ATA.h
 	DEV9/ATA/HddCreate.h
@@ -537,6 +563,11 @@ set(pcsx2GSSources
 	GS/GSUtil.cpp
 	GS/GSVector.cpp
 	GS/MultiISA.cpp
+	GS/DriverReport/GSDriverReport.cpp
+	GS/DriverReport/GSDriverReportClassify.cpp
+	GS/DriverReport/GSDriverReportJson.cpp
+	GS/DriverReport/GSDriverReportProfile.cpp
+	GS/DriverReport/GSDriverReportSystem.cpp
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
 	GS/Renderers/Common/GSFieldShiftDetector.cpp
@@ -567,8 +598,19 @@ set(pcsx2GSSources
 	GS/Renderers/SW/GSTextureCacheSW.cpp
 	)
 
+# The Mali kernel-driver probe for the driver report: MIT-licensed C, Linux and Android only.
+if(UNIX AND NOT APPLE)
+	list(APPEND pcsx2GSSources GS/DriverReport/mali_kbase_probe.c)
+	set_source_files_properties(GS/DriverReport/mali_kbase_probe.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-std=c11")
+endif()
+
 # GS headers
 set(pcsx2GSHeaders
+	GS/DriverReport/GSDriverReport.h
+	GS/DriverReport/GSDriverReportClassify.h
+	GS/DriverReport/GSDriverReportJson.h
+	GS/DriverReport/GSDriverReportProfile.h
+	GS/DriverReport/GSDriverReportSystem.h
 	GS/GSAlignedClass.h
 	GS/GSBlock.h
 	GS/GSBackQueue.h
@@ -605,6 +647,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSDrawRoad.h
 	GS/Renderers/Common/GSFastList.h
+	GS/Renderers/Common/GSAlphaBitLogicOp.h
 	GS/Renderers/Common/GSFastStencilShadow.h
 	GS/Renderers/Common/GSFieldShiftDetector.h
 	GS/Renderers/Common/GSFieldShiftPolicy.h
@@ -653,6 +696,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.h
 	GS/Renderers/SW/GSDrawScanline.h
 	GS/Renderers/SW/GSNewCodeGenerator.h
+	GS/Renderers/SW/GSPerspectivePlane.h
 	GS/Renderers/SW/GSRasterizer.h
 	GS/Renderers/SW/GSRendererSW.h
 	GS/Renderers/SW/GSScanlineEnvironment.h
@@ -744,6 +788,7 @@ if(USE_VULKAN)
 		GS/Renderers/Vulkan/VKBuilders.cpp
 		GS/Renderers/Vulkan/VKLibretro.cpp
 		GS/Renderers/Vulkan/VKLoader.cpp
+		GS/DriverReport/GSDriverReportVulkan.cpp
 		GS/Renderers/Vulkan/VKShaderCache.cpp
 		GS/Renderers/Vulkan/VKStreamBuffer.cpp
 		GS/Renderers/Vulkan/VKSwapChain.cpp

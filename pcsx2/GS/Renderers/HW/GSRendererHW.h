@@ -212,7 +212,7 @@ private:
 	bool CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_tex);
 	bool (*SwPrimRender)(GSRendererHW&, bool invalidate_tc, bool add_ee_transfer);
 
-	void SnapSpriteEdgesToPixelGrid();
+	bool SnapSpriteEdgesToPixelGrid();
 
 	template <bool linear>
 	void RoundSpriteOffset();
@@ -368,8 +368,19 @@ private:
 	// EmulateChannelShuffle replaced this draw's sprites with a quad of its own. Reset per draw in
 	// DrawPrims; CorrectSpriteCoverageForUpscale leaves such a quad alone.
 	bool m_channel_shuffle_rebuilt_quad = false;
+	// The pixel-grid snap moved a sprite in this draw and wrote every sprite's far-edge sample
+	// limit into its ST. Reset per draw in DrawPrims.
+	bool m_sprite_edge_clamp = false;
+	std::vector<GSVector2> m_sprite_edge_limits;
 
 	GSTextureCache::Target* m_last_rt;
+
+	// GSAlphaBitLogicOp: the target whose last destination-alpha draw could have shared a stencil
+	// copy, and its DATM. A second such draw with only marks or nothing on that target in between
+	// takes Stencil DATE and reuses the copy.
+	GSTexture* m_date_chain_rt = nullptr;
+	u8 m_date_chain_datm = 0;
+	bool m_date_draw_shares_copy = false; ///< This draw's DATE keeps a shared copy true (set by EmulateDATESelectMethod).
 
 	GIFRegFRAME m_split_clear_start = {};
 	GIFRegZBUF m_split_clear_start_Z = {};
@@ -426,6 +437,8 @@ public:
 	void Destroy() override;
 
 	void UpdateRenderFixes() override;
+	bool DrawClearsScanMask() const override;
+	bool HasMoveHook() const override { return m_mv != nullptr; }
 
 	bool CanUpscale() override;
 	float GetUpscaleMultiplier() override;

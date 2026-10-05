@@ -12,6 +12,7 @@
 #include "common/TextureDecompress.h"
 
 #include "Config.h"
+#include "GS/GS.h"
 #include "Host.h"
 #include "IconsFontAwesome.h"
 #include "GS/GSExtra.h"
@@ -31,6 +32,13 @@
 #include <unordered_set>
 #include <tuple>
 #include <thread>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
+#endif
 
 // this is a #define instead of a variable to avoid warnings from non-literal format strings
 #define TEXTURE_FILENAME_FORMAT_STRING "%" PRIx64 "-%08x"
@@ -219,6 +227,13 @@ size_t GSTextureReplacements::GetReplacementCacheBudget()
 	size_t budget = MIN_BUDGET;
 	if (physical > RESERVE)
 		budget = static_cast<size_t>(physical) - RESERVE;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	// iOS kills an app long before physical RAM runs out, and every replacement on screen is held
+	// twice in shared memory, here and as a GPU texture, so take half of what the app may still use.
+	const size_t available = os_proc_available_memory();
+	if (available != 0)
+		budget = available / 2;
+#endif
 	if (budget < MIN_BUDGET)
 		budget = MIN_BUDGET;
 
@@ -519,6 +534,9 @@ static bool GetWrongCasePath(std::string* output, const char* dir, std::string_v
 
 void GSTextureReplacements::ReloadReplacementMap()
 {
+	// The back thread's texture cache looks replacements up in these maps while it draws.
+	GSDrainBackQueue();
+
 	SyncWorkerThread();
 	ScopedGuard startup_complete_guard([]() { NotifyStartupCompleteForCurrentGame(); });
 

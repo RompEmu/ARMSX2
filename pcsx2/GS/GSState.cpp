@@ -10,6 +10,7 @@
 #include "GS/GSUtil.h"
 #include "GS/GSVertexKick.h"
 #include "PerformanceMetrics.h"
+#include "VMManager.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -26,6 +27,7 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/prctl.h>
 #endif
 
 
@@ -249,49 +251,25 @@ GSState::GSState(GSBackQueue::Channel* shared_chan, bool is_front_parser)
 	m_nativeres = GSConfig.UpscaleMultiplier == 1.0f;
 	SetCullGrid(ConfigCullGrid());
 	m_mipmap = GSConfig.Mipmap;
-	m_back_records = GSConfig.BackThreadModeResolved != GSBackThreadMode::Off;
 	if (shared_chan)
 	{
 		// Front parser object of the two-object split: records go to the back
 		// object's channel, whose thread is already running (GS.cpp only
 		// creates a front once the back engaged). The back object owns the
 		// thread and the pooled arrays; this object only stages and pushes.
-		pxAssertRel(m_back_records && shared_chan->consumer_running, "GS front object requires a running back thread");
+		// Pushes don't drain: the ring and the pools bound the runahead, and
+		// every seam that reaches back state drains explicitly first.
+		pxAssertRel(shared_chan->consumer_running, "GS front object requires a running back thread");
 		m_chan = shared_chan;
-		m_back_queued = true;
-		// True pipelining: pushes don't drain — the ring and the pool
-		// backpressure bound the runahead, and every seam that reaches back
-		// state drains explicitly first.
-		m_back_lockstep = false;
+		m_back_records = true;
 		AdoptTransferBuffer();
 	}
-	else if (m_back_records)
+	else if (GSConfig.BackThreadResolved)
 	{
-		Console.WriteLn("GS: back-thread mode %d (record path active).", static_cast<int>(GSConfig.BackThreadModeResolved));
-
-		AdoptTransferBuffer();
-
-		if (GSConfig.BackThreadModeResolved >= GSBackThreadMode::Lockstep)
-		{
-			// A GL device is context-bound to the MTGS thread; HW draws would
-			// issue GL calls from the back thread. SW never touches the device
-			// off the vsync path (which stays front-side), so it's fine on any
-			// API.
-			const bool device_ok = !GSConfig.UseHardwareRenderer() ||
-			                       (g_gs_device && g_gs_device->GetRenderAPI() == RenderAPI::Vulkan);
-			if (device_ok)
-			{
-				m_back_queued = true;
-				// True pipelining needs the front-object split — Pipelined runs
-				// lockstep until that lands.
-				m_back_lockstep = true;
-				StartBackThread();
-			}
-			else
-			{
-				Console.Warning("GS: back-thread mode requires Vulkan or SW renderer — falling back to inline records.");
-			}
-		}
+		// The back renderer object of the split. It never produces records: GS.cpp builds the
+		// front parser object on top of it, which does. GSBackThreadPolicy.h has already refused
+		// the split where it cannot work (a non-Vulkan hardware device, Unsynchronized downloads).
+		StartBackThread();
 	}
 
 	memset(&m_v, 0, sizeof(m_v));
@@ -353,7 +331,7 @@ GSState::~GSState()
 		delete node;
 	}
 
-	// m_tr.buff aliases a payload node in record modes; the arena owns it, and
+	// On the front m_tr.buff aliases a payload node; the arena owns it, and
 	// ~GSTransferBuffer must not free it a second time.
 	if (m_back_records)
 		m_tr.buff = nullptr;
@@ -651,13 +629,18 @@ void GSState::ResetDrawBufferIdx()
 				continue;
 			}
 
-			memcpy(m_vertex_buffers[entry_ptr].buff, m_vertex_buffers[i].buff, sizeof(GSVertex) * m_vertex_buffers[i].tail);
+			// Hand the pending arrays to the empty slot rather than copying into its own. Slots
+			// grow independently, and on the split every flush exchanges a slot's arrays for a
+			// pool node's, so the destination's arrays can be smaller than what is pending.
+			std::swap(m_vertex_buffers[entry_ptr].buff, m_vertex_buffers[i].buff);
+			std::swap(m_vertex_buffers[entry_ptr].buff_copy, m_vertex_buffers[i].buff_copy);
+			std::swap(m_vertex_buffers[entry_ptr].maxcount, m_vertex_buffers[i].maxcount);
+			std::swap(m_index_buffers[entry_ptr].buff, m_index_buffers[i].buff);
 
 			m_vertex_buffers[entry_ptr].head = m_vertex_buffers[i].head;
 			m_vertex_buffers[entry_ptr].tail = m_vertex_buffers[i].tail;
 			m_vertex_buffers[entry_ptr].next = m_vertex_buffers[i].next;
 
-			memcpy(m_index_buffers[entry_ptr].buff, m_index_buffers[i].buff, sizeof(u16) * m_index_buffers[i].tail);
 			m_index_buffers[entry_ptr].tail = m_index_buffers[i].tail;
 
 			if (m_vertex_buffers[entry_ptr].tail != 0)
@@ -744,9 +727,7 @@ void GSState::ResetDrawBuffers()
 GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 {
 	// Recycle first; grow the arena while under the cap; past the cap the ring
-	// IS the backpressure (wait for the consumer to release one). Inline modes
-	// release synchronously, so the wait can only engage once draws execute on
-	// the back thread.
+	// IS the backpressure (wait for the consumer to release a batch).
 	for (;;)
 	{
 		if (GSBackQueue::DrawNode** slot = m_chan->draw_free.Peek())
@@ -759,7 +740,9 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 		if (m_chan->draw_arena.size() < GSBackQueue::Channel::kMaxDrawNodes)
 			break;
 
-		std::this_thread::yield();
+		m_chan->space.Wait([this]() {
+			return m_chan->draw_free.Size() >= GSBackQueue::Channel::kDrawRefill;
+		});
 	}
 
 	// Fresh node, arrays sized like the buffer they're about to replace
@@ -810,7 +793,9 @@ GSBackQueue::PayloadNode* GSState::AcquirePayloadNode()
 		if (m_chan->payload_arena.size() < GSBackQueue::Channel::kMaxPayloadNodes)
 			break;
 
-		std::this_thread::yield();
+		m_chan->space.Wait([this]() {
+			return m_chan->payload_free.Size() >= GSBackQueue::Channel::kPayloadRefill;
+		});
 	}
 
 	constexpr size_t alloc_size = 1024 * 1024 * 4; // = GSTransferBuffer's buffer
@@ -832,10 +817,7 @@ void GSState::RotateTransferPayload()
 
 	GSBackQueue::ReleasePayloadRecord rec;
 	rec.node = m_tr_payload_node;
-	if (m_back_queued)
-		PushRecord(GSBackQueue::RecordType::ReleasePayload, rec);
-	else
-		ExecReleasePayloadRecord(rec);
+	PushRecord(GSBackQueue::RecordType::ReleasePayload, rec);
 
 	m_tr_payload_node = AcquirePayloadNode();
 	m_tr.buff = m_tr_payload_node->buff;
@@ -855,15 +837,18 @@ void GSState::StartBackThread()
 {
 	m_back_thread_exit.store(false, std::memory_order_release);
 	m_chan->consumer_running = true;
-	// Claim the empty-wait for this thread (the MTGS thread — every drain site,
-	// and the lockstep tail of PushRecord, run on it). See Channel::drain_thread.
+	// Claim the empty-wait for this thread (the MTGS thread — every drain site
+	// runs on it). See Channel::drain_thread.
 	m_chan->drain_thread = std::this_thread::get_id();
+#if defined(__linux__)
+	// This thread is the producer, and its waits for ring or pool space are
+	// timed in tens of microseconds (GSBackQueue::SpaceWait). The default 50us
+	// timer slack would stretch every one of them past the point where the back
+	// thread has to wake it with a post, which is the cost the timeout avoids.
+	prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
+#endif
 	m_back_thread = std::thread(&GSState::BackThreadLoop, this);
-	// The drain policy is the PRODUCER's (the front object under the split
-	// runs pipelined while this back object's own flag stays lockstep), so
-	// report the configured mode, not this object's flag.
-	Console.WriteLn("GS: back thread started (%s).",
-		GSConfig.BackThreadModeResolved == GSBackThreadMode::Pipelined ? "pipelined" : "lockstep");
+	Console.WriteLn("GS: back thread started (pipelined).");
 }
 
 void GSState::StopBackThread()
@@ -877,7 +862,6 @@ void GSState::StopBackThread()
 	m_back_thread.join();
 	PerformanceMetrics::SetGSBackThread({});
 	m_chan->consumer_running = false;
-	m_back_queued = false;
 }
 
 void GSState::DrainBackQueue()
@@ -903,20 +887,15 @@ void GSState::BackThreadLoop()
 
 	Threading::ThreadHandle handle(Threading::ThreadHandle::GetForCallingThread());
 
-	// A new thread inherits the spawner's affinity mask, and the spawner here is
-	// the MTGS thread — which EnableThreadPinning may have pinned to a single
-	// core (always the case when the back thread is respawned via GSreopen).
-	// Sharing that one core would time-slice front and back and silently
-	// re-serialize the split, so clear to all cores. VMManager owns any future
-	// explicit pinning policy for this thread.
-	handle.SetAffinity(0);
-
-	// Nothing places this thread (VMManager pins the EE, VU and MTGS threads only), so say where
-	// the scheduler first put it. One sample, not a residency figure: it can migrate at any time.
+	// VMManager places this thread next to the MTGS thread (see SetEmuThreadAffinities). The
+	// registration applies that placement now, including replacing the MTGS thread's mask this
+	// thread inherited, which may be a single core and would re-serialize the split.
+	const u64 placed = VMManager::Internal::RegisterGSBackThread(&handle);
 #if defined(__linux__)
-	Console.WriteLn("GS: back thread is unpinned (any core); first ran on CPU %d.", sched_getcpu());
+	Console.WriteLn("GS: back thread starts on CPU mask 0x%llx (0 = any; re-placed when thread affinities are applied); first ran on CPU %d.",
+		static_cast<unsigned long long>(placed), sched_getcpu());
 #else
-	Console.WriteLn("GS: back thread is unpinned (any core).");
+	Console.WriteLn("GS: back thread starts on CPU mask 0x%llx (0 = any; re-placed when thread affinities are applied).", static_cast<unsigned long long>(placed));
 #endif
 
 	// Half the GS work runs here under the split, and the OSD's "GS" figure is the MTGS
@@ -935,8 +914,13 @@ void GSState::BackThreadLoop()
 		{
 			ExecRecordSlot(*slot);
 			m_chan->ring.Pop();
+			m_chan->space.NotifyRetired([this]() { return m_chan->ring.Size(); });
 		}
+		m_chan->space.NotifyIdle();
 	}
+
+	// Before the thread exits, so a placement change never targets a dead thread id.
+	VMManager::Internal::RegisterGSBackThread(nullptr);
 }
 
 void GSState::ExecRecordSlot(const GSBackQueue::RecordSlot& slot)
@@ -3142,49 +3126,7 @@ void GSState::ApplyTEX0(GIFRegTEX0& TEX0)
 	m_env.CTXT[i].TEX0 = TEX0;
 
 	if (wt)
-	{
-		GIFRegBITBLTBUF BITBLTBUF = {};
-		GSVector4i r;
-
-		if (TEX0.CSM == 0)
-		{
-			BITBLTBUF.SBP = TEX0.CBP;
-			BITBLTBUF.SBW = 1;
-			BITBLTBUF.SPSM = TEX0.CPSM;
-
-			r.left = 0;
-			r.top = 0;
-			r.right = GSLocalMemory::m_psm[TEX0.CPSM].bs.x;
-			r.bottom = GSLocalMemory::m_psm[TEX0.CPSM].bs.y;
-
-			int blocks = 4;
-
-			if (GSLocalMemory::m_psm[TEX0.CPSM].trbpp == 16)
-				blocks >>= 1;
-
-			if (GSLocalMemory::m_psm[TEX0.PSM].trbpp == 4)
-				blocks >>= 1;
-
-			// Invalidating videomem is slow, so *only* do it when it's definitely a CLUT draw in HW mode.
-			for (int j = 0; j < blocks; j++, BITBLTBUF.SBP++)
-				InvalidateLocalMem(BITBLTBUF, r, true);
-		}
-		else
-		{
-			BITBLTBUF.SBP = TEX0.CBP;
-			BITBLTBUF.SBW = m_env.TEXCLUT.CBW;
-			BITBLTBUF.SPSM = TEX0.CPSM;
-
-			r.left = m_env.TEXCLUT.COU;
-			r.top = m_env.TEXCLUT.COV;
-			r.right = r.left + GSLocalMemory::m_psm[TEX0.CPSM].pal;
-			r.bottom = r.top + 1;
-
-			InvalidateLocalMem(BITBLTBUF, r, true);
-		}
-
 		SubmitClutLoad(m_env.CTXT[i].TEX0, m_env.TEXCLUT);
-	}
 
 	u64 mask = 0x1fffffffffull; // TBP0 TBW PSM TW TH TCC TFX
 	if ((TEX0.PSM & 0x7) >= 3)
@@ -3860,7 +3802,7 @@ void GSState::FlushWrite()
 	// transfer Init rotates it out instead of reusing it.
 	m_tr_payload_referenced = m_back_records;
 
-	if (m_back_queued)
+	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::Transfer, rec);
 	else
 		ExecTransferRecord(rec);
@@ -4094,6 +4036,8 @@ void GSState::FlushPrim()
 	// Front side: draw serials are front-assigned — the front decides draw order.
 	s_n++;
 
+	const GSBackQueue::DrawPrivRegs priv = CaptureDrawPrivRegs();
+
 	if (m_back_records)
 	{
 		// Hand the live buffers to a pool node: snapshot the buffer structs into
@@ -4130,6 +4074,7 @@ void GSState::FlushPrim()
 		rec.flush_reason = m_state_flush_reason;
 		rec.channel_shuffle_finish = m_channel_shuffle_finish;
 		rec.packed_uv_hack_flag = m_isPackedUV_HackFlag;
+		rec.priv = priv;
 
 		// m_channel_shuffle_finish is written on BOTH sides: the front's
 		// ApplyTEX0 sets it as a one-shot "abort shuffle skip" message, while
@@ -4141,30 +4086,27 @@ void GSState::FlushPrim()
 		if (m_mem_target != this)
 			m_channel_shuffle_finish = false;
 
-		if (m_back_queued)
-		{
-			// The consumer releases the node after the tail runs.
-			PushRecord(GSBackQueue::RecordType::Draw, rec);
-		}
-		else
-		{
-			// Inline consume point: the executor is done with the node.
-			ExecDrawRecord(rec);
-			ReleaseDrawNode(node);
-		}
+		// The consumer releases the node after the tail runs.
+		PushRecord(GSBackQueue::RecordType::Draw, rec);
 
-		// The executor re-aimed m_vertex/m_index at the node's structs (in
-		// lockstep the drain inside PushRecord has already happened) — restore
-		// them to the parse slot before the reset below; this re-aim is what
-		// keeps the front parsing its own buffers.
-		m_vertex = &m_vertex_buffers[m_current_buffer_idx];
-		m_index = &m_index_buffers[m_current_buffer_idx];
+		// GSC_IRem clears SCANMSK in the parse environment at the start of the draw, and on a
+		// single object that clear lasts until the game writes SCANMSK again. On the split the
+		// hook clears the back's installed copy, which the next record overwrites, so repeat it
+		// here for every draw that reaches Draw(). Not exact for a draw the hook's own skip
+		// counter lets through (back-side state): a single object leaves the mask set there.
+		if (m_mem_target != this && m_mem_target->DrawClearsScanMask() &&
+			!(m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER))
+		{
+			m_env.SCANMSK.MSK = 0;
+			m_prev_env.SCANMSK.MSK = 0;
+		}
 	}
 	else
 	{
 		// Off path: every field the record would carry is captured from live
 		// state and installed back over the same live state, so the round-trip
 		// is an identity — skip it and run the tail directly.
+		m_draw_priv = priv;
 		DrawRecordTail(s_n);
 	}
 
@@ -4234,6 +4176,7 @@ void GSState::ExecDrawRecord(const GSBackQueue::DrawRecord& rec)
 	else
 		m_channel_shuffle_finish = rec.channel_shuffle_finish;
 	m_isPackedUV_HackFlag = rec.packed_uv_hack_flag;
+	m_draw_priv = rec.priv;
 
 	// On a split back object nobody ran FlushDraw here — aim the draw pointers
 	// at the installed draw env exactly as FlushDraw does on the front, and
@@ -4257,6 +4200,17 @@ void GSState::ExecDrawRecord(const GSBackQueue::DrawRecord& rec)
 	}
 }
 
+GSBackQueue::DrawPrivRegs GSState::CaptureDrawPrivRegs()
+{
+	GSBackQueue::DrawPrivRegs priv;
+	priv.dispfb_fbp[0] = m_regs->DISP[0].DISPFB.FBP;
+	priv.dispfb_fbp[1] = m_regs->DISP[1].DISPFB.FBP;
+	priv.display_enabled[0] = m_regs->PMODE.EN1;
+	priv.display_enabled[1] = m_regs->PMODE.EN2;
+	priv.field_render = m_regs->SMODE2.FFMD && isReallyInterlaced();
+	return priv;
+}
+
 // The draw executor's tail: everything from vertex trace to Draw() + perfmon,
 // running against installed (or, on the record-off path, live) state.
 void GSState::DrawRecordTail(u64 draw_serial)
@@ -4266,8 +4220,8 @@ void GSState::DrawRecordTail(u64 draw_serial)
 	// internal frame rate detection based on sprite blits to the display framebuffer
 	{
 		const u32 FRAME_FBP = m_context->FRAME.FBP;
-		if ((m_regs->DISP[0].DISPFB.FBP == FRAME_FBP && m_regs->PMODE.EN1) ||
-			(m_regs->DISP[1].DISPFB.FBP == FRAME_FBP && m_regs->PMODE.EN2))
+		if ((m_draw_priv.dispfb_fbp[0] == FRAME_FBP && m_draw_priv.display_enabled[0]) ||
+			(m_draw_priv.dispfb_fbp[1] == FRAME_FBP && m_draw_priv.display_enabled[1]))
 		{
 			g_perfmon.AddDisplayFramebufferSpriteBlit();
 		}
@@ -4290,7 +4244,7 @@ void GSState::DrawRecordTail(u64 draw_serial)
 	// Helps Manhunt (lights shining through objects).
 	// Can help with some alignment issues when upscaling too, and is for both Software and Hardware renderers.
 	// Sometimes hardware doesn't get affected, likely due to the difference in how GPU's handle textures (Persona minimap).
-	if (PRIM->TME && (GSUtil::GetPrimClass(PRIM->PRIM) == GS_PRIM_CLASS::GS_SPRITE_CLASS || m_vt.m_eq.z))
+	if (PRIM->TME && (GSUtil::GetPrimClass(PRIM->PRIM) == GS_PRIM_CLASS::GS_SPRITE_CLASS || m_vt.m_eq.z) && !BuildsConsolePlane())
 	{
 		if (!PRIM->FST) // STQ's
 		{
@@ -4631,7 +4585,7 @@ void GSState::Write(const u8* mem, int len)
 			if (m_mem_target != this)
 				s_transfer_n++;
 
-			if (m_back_queued)
+			if (m_back_records)
 				PushRecord(GSBackQueue::RecordType::Transfer, rec);
 			else
 				ExecTransferRecord(rec);
@@ -4754,12 +4708,30 @@ void GSState::SubmitMove()
 	rec.blit = m_env.BITBLTBUF;
 	rec.pos = m_env.TRXPOS;
 	rec.reg = m_env.TRXREG;
+	rec.dir = m_env.TRXDIR;
 	rec.draw_serial = s_n;
 
-	if (m_back_queued)
+	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::Move, rec);
 	else
 		ExecMoveRecord(rec);
+
+	// Split front: Move() sets TRXDIR to 3 on the back. A single object would see that in its
+	// own env, and the IMAGE tag, FIFO read and savestate paths here test it. The ordinary move
+	// always ends at 3; a move hook may take the move and leave 2, and only the back knows
+	// whether it did, so with a hook armed wait for the move and copy its result.
+	if (m_mem_target != this)
+	{
+		if (m_mem_target->HasMoveHook())
+		{
+			DrainBackQueue();
+			m_env.TRXDIR.XDIR = m_mem_target->m_env.TRXDIR.XDIR;
+		}
+		else
+		{
+			m_env.TRXDIR.XDIR = 3;
+		}
+	}
 }
 
 void GSState::ExecMoveRecord(const GSBackQueue::MoveRecord& rec)
@@ -4770,6 +4742,7 @@ void GSState::ExecMoveRecord(const GSBackQueue::MoveRecord& rec)
 	m_env.BITBLTBUF = rec.blit;
 	m_env.TRXPOS = rec.pos;
 	m_env.TRXREG = rec.reg;
+	m_env.TRXDIR = rec.dir;
 
 	Move();
 }
@@ -4784,7 +4757,7 @@ void GSState::SubmitClutLoad(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLU
 	rec.TEX0 = TEX0;
 	rec.TEXCLUT = TEXCLUT;
 
-	if (m_back_queued)
+	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::ClutLoad, rec);
 	else
 		ExecClutLoadRecord(rec);
@@ -4792,6 +4765,56 @@ void GSState::SubmitClutLoad(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLU
 
 void GSState::ExecClutLoadRecord(const GSBackQueue::ClutLoadRecord& rec)
 {
+	// The palette's source memory must be current before it is read: the software renderer
+	// waits for rasterizer threads still drawing into it, the hardware renderer reads back
+	// targets that overlap it. This runs here rather than at submit because only the object
+	// that owns local memory can do either.
+	const GIFRegTEX0& TEX0 = rec.TEX0;
+	GIFRegBITBLTBUF BITBLTBUF = {};
+	GSVector4i r;
+
+	if (TEX0.CSM == 0)
+	{
+		BITBLTBUF.SBP = TEX0.CBP;
+		BITBLTBUF.SBW = 1;
+		BITBLTBUF.SPSM = TEX0.CPSM;
+
+		r.left = 0;
+		r.top = 0;
+		r.right = GSLocalMemory::m_psm[TEX0.CPSM].bs.x;
+		r.bottom = GSLocalMemory::m_psm[TEX0.CPSM].bs.y;
+
+		int blocks = 4;
+
+		if (GSLocalMemory::m_psm[TEX0.CPSM].trbpp == 16)
+			blocks >>= 1;
+
+		if (GSLocalMemory::m_psm[TEX0.PSM].trbpp == 4)
+			blocks >>= 1;
+
+		// Invalidating videomem is slow, so *only* do it when it's definitely a CLUT draw in HW mode.
+		for (int j = 0; j < blocks; j++, BITBLTBUF.SBP++)
+			InvalidateLocalMem(BITBLTBUF, r, true);
+	}
+	else
+	{
+		BITBLTBUF.SBP = TEX0.CBP;
+		BITBLTBUF.SBW = rec.TEXCLUT.CBW;
+		BITBLTBUF.SPSM = TEX0.CPSM;
+
+		r.left = rec.TEXCLUT.COU;
+		r.top = rec.TEXCLUT.COV;
+		r.right = r.left + GSLocalMemory::m_psm[TEX0.CPSM].pal;
+		r.bottom = r.top + 1;
+
+		InvalidateLocalMem(BITBLTBUF, r, true);
+	}
+
+	// The load decision (which palette is current, and that it is clean) was recorded on the
+	// submitting object. With multi-threading on that is the front, and the draw-time palette
+	// readers on this object (CSM2 offsets, PossibleCLUTDraw) need it too. With it off this
+	// repeats the same assignment.
+	m_mem.m_clut.WriteDecision(rec.TEX0, rec.TEXCLUT);
 	m_mem.m_clut.WriteLoad(rec.TEX0, rec.TEXCLUT);
 }
 
@@ -4801,7 +4824,7 @@ void GSState::SubmitPcrtcSync()
 	std::memcpy(&rec.displays, &PCRTCDisplays, sizeof(rec.displays));
 	rec.scanmask_used = m_scanmask_used;
 
-	if (m_back_queued)
+	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::PcrtcSync, rec);
 	else
 		ExecPcrtcSyncRecord(rec);
@@ -5256,7 +5279,7 @@ void GSState::Transfer(const u8* mem, u32 size)
 						Write(mem, len * 16);
 						break;
 					case 2:
-						Move();
+						SubmitMove();
 						break;
 					default: // 1 and 3
 						// 1 is invalid because downloads can only be done
@@ -6816,7 +6839,7 @@ bool GSState::SpriteUnionCoversDrawRect()
 	return true;
 }
 
-void GSState::CalculatePrimitiveCoversWithoutGaps()
+void GSState::CalculatePrimitiveCoversWithoutGaps(bool union_cover)
 {
 	m_primitive_covers_without_gaps = FullCover;
 	m_primitive_union_covers_rect = false;
@@ -6848,7 +6871,7 @@ void GSState::CalculatePrimitiveCoversWithoutGaps()
 	m_primitive_covers_without_gaps = SpriteDrawWithoutGaps() ? (m_primitive_covers_without_gaps == GapsFound ? SpriteNoGaps : m_primitive_covers_without_gaps) : GapsFound;
 
 	// Asked only where the tiling test refused, and answered onto a flag of its own.
-	if (m_primitive_covers_without_gaps == GapsFound)
+	if (union_cover && m_primitive_covers_without_gaps == GapsFound)
 		m_primitive_union_covers_rect = SpriteUnionCoversDrawRect();
 }
 

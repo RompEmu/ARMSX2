@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+namespace GSDriverReport
+{
+	struct BackendReport;
+}
+
 enum class Filter
 {
 	Nearest = 0,
@@ -711,7 +716,7 @@ struct alignas(16) GSHWDrawConfig
 				u8 iip : 1;
 				u8 point_size : 1;		///< Set when points need to be expanded without VS expanding.
 				VSExpand expand : 3;
-				u8 _free : 1;
+				u8 sprite_edge_clamp : 1; ///< ST carries each sprite's far-edge sample limit; see PSSelector::sprite_edge_clamp.
 			};
 			u8 key;
 		};
@@ -852,6 +857,11 @@ struct alignas(16) GSHWDrawConfig
 				// writes the per-triangle alpha step to both outputs instead of a colour, for a blend
 				// of source DST_ALPHA and destination SRC1_ALPHA. Reads nothing.
 				u32 stencil_counter : 1;
+
+				// A sprite whose far edge the pixel-grid snap pushed out reads no further than its
+				// last native pixel did. The limit rides in the vertex ST, which an FST sprite does
+				// not otherwise use; see CorrectSpriteCoverageForUpscale.
+				u32 sprite_edge_clamp : 1;
 			};
 
 			struct
@@ -1047,8 +1057,11 @@ struct alignas(16) GSHWDrawConfig
 				u8 zwe  : 1;
 				u8 date : 1;
 				u8 date_one : 1;
+				// GSAlphaBitLogicOp: a logic-op mark that also keeps the destination-alpha stencil copy
+				// true: 0 leaves the stencil alone, 1 writes 0 (the test now fails), 2 writes 1.
+				u8 alpha_bit_stencil : 2;
 
-				u8 _free : 3;
+				u8 _free : 1;
 			};
 			u8 key;
 		};
@@ -1072,7 +1085,9 @@ struct alignas(16) GSHWDrawConfig
 				u8 wb : 1;
 				u8 wa : 1;
 
-				u8 _free : 4;
+				// GSAlphaBitLogicOp: 0 none, 1 OR, 2 AND_INVERTED. Only Vulkan sets it.
+				u8 logic_op : 2;
+				u8 _free : 2;
 			};
 			struct
 			{
@@ -1326,6 +1341,8 @@ struct alignas(16) GSHWDrawConfig
 	u32 nverts;            ///< Number of vertices
 	u32 nindices;          ///< Number of indices
 	u32 indices_per_prim;  ///< Number of indices that make up one primitive
+	u32 logic_op_split;    ///< With colormask.logic_op set: the indices before this one take that op, the rest the opposite (GSAlphaBitLogicOp.h). 0 = one op for the whole draw.
+	u8 date_copy;          ///< GSAlphaBitLogicOp::DateCopy: 1 = a Stencil DATE draw that may reuse the stencil copy left by the previous one in the same render pass, and leaves it true.
 	const std::vector<size_t>* drawlist;          ///< For reducing barriers on sprites
 	const std::vector<GSVector4i>* drawlist_bbox; ///< For RT copy when barriers not available.
 	GSVector4i scissor; ///< Scissor rect
@@ -1344,6 +1361,7 @@ struct alignas(16) GSHWDrawConfig
 	bool require_one_barrier;  ///< Require texture barrier before draw (also used to requst an rt copy if texture barrier isn't supported)
 	bool require_full_barrier; ///< Require texture barrier between all prims
 	bool offset_read_hits_write; ///< An offset read of the RT whose filter reaches pixels this draw writes; see GSDrawRoadDraw
+	bool raster_order;         ///< The draw's barriers were dropped on a road that orders overlapping primitives only on request (FeatureSupport::declared_loop_overlap_needs_raster_order), and its primitives may overlap: the backend must request rasterization-order access.
 	GSDrawRoad road;           ///< How the draw's self-read is served; decided by the renderer, see GSDrawRoad.h
 
 	enum : u32
@@ -1380,6 +1398,27 @@ struct alignas(16) GSHWDrawConfig
 		u8 no_color1 : 1;
 		u8 blend_hw : 3; // HWBlendType
 		u8 dither : 2;
+		/// The second pass runs the first pass's shader with its software-blend bits (blend_a, blend_b,
+		/// blend_d, blend_mix) cleared. blend_hw types 1-3 are only a pure function of the colour and
+		/// alpha when those are clear: with them set the shader takes its software-blend branch, where
+		/// the same codes mean something else.
+		u8 clear_sw_blend : 1;
+
+		/// Turns the first pass's pixel shader selector into the second pass's. Every backend that runs
+		/// the second pass takes the selector from here, so they cannot differ on what it changes.
+		void ApplyTo(PSSelector& ps) const
+		{
+			ps.no_color1 = no_color1;
+			ps.blend_hw = blend_hw;
+			ps.dither = dither;
+			if (clear_sw_blend)
+			{
+				ps.blend_a = 0;
+				ps.blend_b = 0;
+				ps.blend_d = 0;
+				ps.blend_mix = 0;
+			}
+		}
 	};
 	static_assert(sizeof(BlendMultiPass) == 8, "blend multi pass is 8 bytes");
 
@@ -1530,10 +1569,12 @@ public:
 	{
 		bool broken_point_sampler : 1; ///< Issue with AMD cards, see tfx shader for details
 		bool vs_expand            : 1; ///< Supports expanding points/lines/sprites in the vertex shader
+		bool sprite_edge_clamp    : 1; ///< The shaders implement PSSelector::sprite_edge_clamp.
 		bool primitive_id         : 1; ///< Supports primitive ID for use with prim tracking destination alpha algorithm
 		bool texture_barrier      : 1; ///< Supports sampling rt and hopefully texture barrier
 		bool multidraw_fb_copy    : 1; ///< Replacement for texture barrier.
 		bool cheap_rt_feedback_read : 1; ///< A feedback read costs nothing structural — no render-pass break, no tile flush — so the renderer may take one on a draw that did not need it. ⚠️ `!texture_barrier` is NOT a substitute: it is equally true of every driver on the RT-copy feedback workaround, where the read is the most expensive one we have.
+		bool alpha_bit_logic_op   : 1; ///< A draw that writes only alpha bit 7 (32-bit frame, FBMSK 0x7FFFFFFF) sets or clears it with a Vulkan logic op instead of reading the target for the shader-emulated mask. Vulkan only, with the logicOp feature, on the road where an ordered read costs a wait per draw (ordered_read_costs_per_draw). See GSAlphaBitLogicOp.h.
 		bool fast_stencil_shadow  : 1; ///< The alpha stencil counter (flat triangles storing their own pixel's alpha times 127/128 or 130/128) is drawn by one dual-source blend instead of a render-target read, and the hardware renderer stops auto-flush from splitting it. Set by Vulkan only, with dual-source blending, on the copy road (each read is a pass break plus a copy) or on a declared feedback loop (each read is in-pass but auto-flush still splits the volume). See GSFastStencilShadow.h. ⚠️ Never infer it from `!texture_barrier`: that bit says whether an in-pass read is legal, not what a read costs, and D3D11 runs without barriers too, with cheap copies and no shader for it.
 		bool provoking_vertex_last: 1; ///< Supports using the last vertex in a primitive as the value for flat shading.
 		bool point_expand         : 1; ///< Supports point expansion in hardware.
@@ -1546,6 +1587,8 @@ public:
 		bool feedback_loop_layout : 1; ///< The backend reaches an attachment it also writes through the attachment-feedback-loop image layout and an ordinary sampler, rather than through an in-tile read. Vulkan-only, and mutually exclusive with `framebuffer_fetch` there.
 		bool framebuffer_fetch_orders_overlap : 1; ///< Framebuffer fetch also orders overlapping primitives *within* a single draw, so a full barrier is redundant. Vulkan's rasterization-order attachment access, Metal's programmable blending and GL's ARM_shader_framebuffer_fetch all guarantee this by spec; GL's EXT_shader_framebuffer_fetch does not deliver it in practice.
 		bool declared_feedback_loop_orders_overlap : 1; ///< The backend declares an attachment feedback loop on the pipeline and the attachment layout, and the driver answers by ordering overlapping primitives within one draw -- the same licence `framebuffer_fetch_orders_overlap` carries, earned a different way (Adreno/Turnip runs a declared-loop pass untiled with a coherent destination read). Set only by the Vulkan backend on the declared-loop road; see GSSelfReadRoadPolicy.h. ⚠️ The ordering is per PIXEL, so an offset read of the target keeps its one barrier on this road instead of taking the copy the in-tile read needs -- see GSDrawRoad.h.
+		bool declared_loop_overlap_needs_raster_order : 1; ///< On the driver-ordered declared-loop road, the driver orders overlapping primitives within one draw only for a pipeline that requests rasterization-order attachment access. The renderer marks the draws that need it (GSHWDrawConfig::raster_order) and the backend requests it for those pipelines only. Set by the Vulkan backend for our generation-2 Turnip on Adreno 7xx, where the per-overlap wait is expensive.
+		bool ordered_read_costs_per_draw : 1; ///< The driver-ordered road still waits for the GPU to drain before each draw that reads the destination (our generation-2 Turnip on Adreno 7xx). GSCopyRoadBlendingPolicy.h treats that road like the barrier road on such a device.
 		bool barrier_read_costs_per_draw : 1; ///< A per-draw texture barrier on this device was measured to cost about what a per-draw copy of the target does, as it does on a tiler: Adreno under Turnip and Apple silicon under Honeykrisp. Set by the Vulkan backend only. GSCopyRoadBlendingPolicy.h reads it to decide whether a destination read on the barrier road is expensive; everywhere it is false -- desktop Vulkan, GL, D3D, Metal -- the barrier road is treated as cheap, as it was before the policy existed.
 		bool stencil_buffer       : 1; ///< Supports stencil buffer, and can use for DATE.
 		bool cas_sharpening       : 1; ///< Supports sufficient functionality for contrast adaptive sharpening.
@@ -1681,6 +1724,14 @@ protected:
 	GSVSyncMode m_vsync_mode = GSVSyncMode::Disabled;
 	bool m_allow_present_throttle = false;
 	bool m_present_has_new_frame = false;
+	struct PresentGeometry
+	{
+		GSVector4i src_rect = GSVector4i::zero(); ///< the game's visible area in GetCurrent(), texture pixels
+		GSVector4 draw_rect = GSVector4::zero();  ///< where it lands in the presentation, pixels
+		bool linear = false;                      ///< bilinear, else nearest
+		bool plain = false;                       ///< the present is nothing but that scaled blit
+	};
+	PresentGeometry m_present_geometry;
 	u64 m_last_frame_displayed_time = 0;
 
 	GSTexture* m_merge = nullptr;
@@ -1962,6 +2013,7 @@ public:
 		// Assume nothing until the frame is actually composited. Several presents legitimately
 		// carry no new game output — see NotePresentHasNewFrame.
 		m_present_has_new_frame = false;
+		m_present_geometry = {};
 		return DoBeginPresent(frame_skip);
 	}
 
@@ -1975,6 +2027,15 @@ public:
 	/// a skipped duplicate, or a boot screen with no GS output yet.
 	void NotePresentHasNewFrame() { m_present_has_new_frame = true; }
 
+	/// How that frame was drawn, recorded with NotePresentHasNewFrame, for frame generation on the
+	/// game's own image: it repeats exactly this scaled blit for each generated frame, so it only
+	/// does so when [plain] says the present was nothing more (no upscaler or sharpening pass, no
+	/// TV shader, no rotation). Otherwise frame generation keeps working on the finished screen.
+	void NotePresentGeometry(const GSVector4i& src_rect, const GSVector4& draw_rect, bool linear, bool plain)
+	{
+		m_present_geometry = {src_rect, draw_rect, linear, plain};
+	}
+
 	/// Presents the frame to the display.
 	virtual void EndPresent() = 0;
 
@@ -1983,6 +2044,10 @@ public:
 
 	/// Returns a string of information about the graphics driver being used.
 	virtual std::string GetDriverInfo() const = 0;
+
+	/// Fills this device's part of the driver report written beside a GS dump. Runs on the GS
+	/// thread. Backends that know more than the base (Vulkan, OpenGL) extend it.
+	virtual void CollectDriverReport(GSDriverReport::BackendReport& out) const;
 
 	/// Enables/disables GPU frame timing.
 	virtual bool SetGPUTimingEnabled(bool enabled) = 0;
