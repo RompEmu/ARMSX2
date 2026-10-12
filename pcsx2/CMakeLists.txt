@@ -63,6 +63,11 @@ endif()
 # Main pcsx2 source
 set(pcsx2Sources
 	Achievements.cpp
+	Arcade/AcGameFile.cpp
+	Arcade/ArcadeFiles.cpp
+	Arcade/ArcadeInput.cpp
+	Arcade/ArcadeSetup.cpp
+	Autosave.cpp
 	BuildVersion.cpp
 	Cache.cpp
 	COP0.cpp
@@ -124,6 +129,7 @@ set(pcsx2Sources
 	SIO/Sio2.cpp
 	SIO/Sio0.cpp
 	SIO/Multitap/MultitapProtocol.cpp
+	SIO/Memcard/MemcardBackup.cpp
 	SIO/Memcard/MemoryCardFile.cpp
 	SIO/Memcard/MemoryCardFolder.cpp
 	SIO/Memcard/MemoryCardProtocol.cpp
@@ -157,6 +163,11 @@ set(pcsx2Sources
 # Main pcsx2 header
 set(pcsx2Headers
 	Achievements.h
+	Arcade/AcGameFile.h
+	Arcade/ArcadeFiles.h
+	Arcade/ArcadeInput.h
+	Arcade/ArcadeSetup.h
+	Autosave.h
 	BuildVersion.h
 	Cache.h
 	Common.h
@@ -209,6 +220,7 @@ set(pcsx2Headers
 	SIO/Sio0.h
 	SIO/SioTypes.h
 	SIO/Multitap/MultitapProtocol.h
+	SIO/Memcard/MemcardBackup.h
 	SIO/Memcard/MemoryCardFile.h
 	SIO/Memcard/MemoryCardFolder.h
 	SIO/Memcard/MemoryCardProtocol.h
@@ -553,6 +565,7 @@ set(pcsx2GSSources
 	GS/GSDrawingContext.cpp
 	GS/GSDrawingEnvironment.cpp
 	GS/GSDump.cpp
+	GS/GSDumpBundle.cpp
 	GS/GSLocalMemory.cpp
 	GS/GSLzma.cpp
 	GS/GSPerfMon.cpp
@@ -564,6 +577,7 @@ set(pcsx2GSSources
 	GS/GSVector.cpp
 	GS/MultiISA.cpp
 	GS/DriverReport/GSDriverReport.cpp
+	GS/DriverReport/GSDriverReportActive.cpp
 	GS/DriverReport/GSDriverReportClassify.cpp
 	GS/DriverReport/GSDriverReportJson.cpp
 	GS/DriverReport/GSDriverReportProfile.cpp
@@ -572,6 +586,7 @@ set(pcsx2GSSources
 	GS/Renderers/Common/GSDirtyRect.cpp
 	GS/Renderers/Common/GSFieldShiftDetector.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
+	GS/Renderers/Common/GSHeadlessPresent.cpp
 	# The GPU driver-bug database is keyed on the DRIVER, not the platform: Turnip, PanVK and the
 	# Qualcomm blob all ship outside Android too (ARM Linux handhelds — Rocknix, Batocera). Building
 	# these only under ANDROID made every rule dead on exactly the hardware we test on, which is how
@@ -595,6 +610,7 @@ set(pcsx2GSSources
 	GS/Renderers/HW/GSTextureCache.cpp
 	GS/Renderers/HW/GSTextureReplacementLoaders.cpp
 	GS/Renderers/HW/GSTextureReplacements.cpp
+	GS/Renderers/HW/GSTextureUpscaler.cpp
 	GS/Renderers/SW/GSTextureCacheSW.cpp
 	)
 
@@ -607,6 +623,7 @@ endif()
 # GS headers
 set(pcsx2GSHeaders
 	GS/DriverReport/GSDriverReport.h
+	GS/DriverReport/GSDriverReportActive.h
 	GS/DriverReport/GSDriverReportClassify.h
 	GS/DriverReport/GSDriverReportJson.h
 	GS/DriverReport/GSDriverReportProfile.h
@@ -620,6 +637,7 @@ set(pcsx2GSHeaders
 	GS/GSDrawingContext.h
 	GS/GSDrawingEnvironment.h
 	GS/GSDump.h
+	GS/GSDumpBundle.h
 	GS/GSExtra.h
 	GS/GSGL.h
 	GS/GSRegs.h
@@ -647,7 +665,9 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSDrawRoad.h
 	GS/Renderers/Common/GSFastList.h
+	GS/Renderers/Common/GSHeadlessPresent.h
 	GS/Renderers/Common/GSAlphaBitLogicOp.h
+	GS/Renderers/Common/GSReplacementAlphaSnap.h
 	GS/Renderers/Common/GSFastStencilShadow.h
 	GS/Renderers/Common/GSFieldShiftDetector.h
 	GS/Renderers/Common/GSFieldShiftPolicy.h
@@ -684,8 +704,11 @@ set(pcsx2GSHeaders
 	GS/Renderers/HW/GSPointPlace.h
 	GS/Renderers/HW/GSRendererHW.h
 	GS/Renderers/HW/GSSpriteEdgeSnap.h
+	GS/Renderers/HW/GSTexelAddressedDraw.h
 	GS/Renderers/HW/GSTextureCache.h
 	GS/Renderers/HW/GSTextureReplacements.h
+	GS/Renderers/HW/GSTextureUpscaleSupport.h
+	GS/Renderers/HW/GSTextureUpscaler.h
 	GS/Renderers/HW/GSVertexHW.h
 	GS/Renderers/SW/GSBlockWalk.h
 	GS/Renderers/SW/GSColourWalk.h
@@ -1094,7 +1117,14 @@ set(pcsx2HostHeaders
 
 set(pcsx2ImGuiSources
 	ImGui/FullscreenUI.cpp
+	ImGui/FullscreenUI_Drivers.cpp
+	ImGui/FullscreenUI_OnlinePatches.cpp
+	ImGui/FullscreenUI_Packs.cpp
+	ImGui/FullscreenUI_Saves.cpp
+	ImGui/FullscreenUI_Arcade.cpp
 	ImGui/FullscreenUI_Settings.cpp
+	ImGui/FullscreenUI_TexturePacks.cpp
+	ImGui/FullscreenUIShot.cpp
 	ImGui/ImGuiFullscreen.cpp
 	ImGui/ImGuiManager.cpp
 	ImGui/ImGuiOverlays.cpp
@@ -1103,6 +1133,8 @@ set(pcsx2ImGuiSources
 set(pcsx2ImGuiHeaders
 	ImGui/FullscreenUI.h
 	ImGui/FullscreenUI_Internal.h
+	ImGui/FullscreenUI_PageDwell.h
+	ImGui/FullscreenUIShot.h
 	ImGui/ImGuiAnimated.h
 	ImGui/ImGuiFullscreen.h
 	ImGui/ImGuiManager.h
@@ -1120,6 +1152,66 @@ set(pcsx2InputHeaders
 	Input/InputSource.h
 	Input/SDLInputSource.h
 )
+
+# Catalog: the online services (texture packs, covers, driver packs, patches, memory-card
+# backups, arcade setup) written once for the Qt and Big Picture UIs. New Catalog files go in
+# these two lists; the HTTP transport at the end picks the one backend for this platform.
+set(pcsx2CatalogSources
+	Catalog/CoverAutoDownload.cpp
+	Catalog/CoverDownloadJob.cpp
+	Catalog/CoverSources.cpp
+	Catalog/DriverPacks.cpp
+	Catalog/FileUtil.cpp
+	Catalog/HttpFetcher.cpp
+	Catalog/Json.cpp
+	Catalog/LocalLinkSettings.cpp
+	Catalog/PatchRepo.cpp
+	Catalog/PnachText.cpp
+	Catalog/ResponseCache.cpp
+	Catalog/TarGz.cpp
+	Catalog/TarZstdExtractor.cpp
+	Catalog/TextureArchivePath.cpp
+	Catalog/TexturePackCatalog.cpp
+	Catalog/TexturePackEngine.cpp
+	Catalog/TexturePackInstaller.cpp
+	Catalog/TexturePackState.cpp
+	Catalog/ZipTextureExtractor.cpp
+)
+set(pcsx2CatalogHeaders
+	Catalog/BlockingAnswer.h
+	Catalog/CancelToken.h
+	Catalog/CoverAutoDownload.h
+	Catalog/CoverDownloadJob.h
+	Catalog/CoverSources.h
+	Catalog/DriverPacks.h
+	Catalog/Fetch.h
+	Catalog/FileOps.h
+	Catalog/FileUtil.h
+	Catalog/HttpFetcher.h
+	Catalog/Json.h
+	Catalog/LocalLinkSettings.h
+	Catalog/PatchRepo.h
+	Catalog/PnachText.h
+	Catalog/ResponseCache.h
+	Catalog/TarGz.h
+	Catalog/TarZstdExtractor.h
+	Catalog/TextureArchivePath.h
+	Catalog/TexturePackCatalog.h
+	Catalog/TexturePackEngine.h
+	Catalog/TexturePackInstaller.h
+	Catalog/TexturePackState.h
+	Catalog/ZipTextureExtractor.h
+)
+# Json.h exposes rapidjson types, so everything that includes it needs the include path.
+target_link_libraries(PCSX2_FLAGS INTERFACE rapidjson)
+if(WIN32)
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportWinHTTP.cpp)
+elseif(ANDROID OR IOS)
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportNone.cpp)
+else()
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportCurl.cpp)
+	target_link_libraries(PCSX2 PRIVATE CURL::libcurl)
+endif()
 
 if(APPLE)
 	list(APPEND pcsx2GSSources
@@ -1650,6 +1742,8 @@ target_sources(PCSX2 PRIVATE
 	${pcsx2ImGuiHeaders}
 	${pcsx2InputSources}
 	${pcsx2InputHeaders}
+	${pcsx2CatalogSources}
+	${pcsx2CatalogHeaders}
 	${pcsx2ps2Sources}
 	${pcsx2ps2Headers}
 )
@@ -1787,6 +1881,13 @@ set_source_files_properties(PrecompiledHeader.cpp PROPERTIES HEADER_FILE_ONLY TR
 # true.
 if(NOT MSVC)
 	set_source_files_properties(VUops.cpp FPU.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
+# The RAISR upscaler's scalar and NEON paths must round identically, so the only fused
+# multiply-adds are the ones it writes out (MulAdd / vfmaq). GSTextureUpscaler.cpp says so with a
+# pragma on clang; this covers GCC.
+if(NOT MSVC)
+	set_source_files_properties(GS/Renderers/HW/GSTextureUpscaler.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 if(COMMAND target_precompile_headers)
 	message("Using precompiled headers.")

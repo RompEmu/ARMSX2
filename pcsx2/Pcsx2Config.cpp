@@ -15,6 +15,7 @@
 #include "GameDatabase.h"
 #include "Host.h"
 #include "Host/AudioStream.h"
+#include "SIO/Memcard/MemcardBackup.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
 #include "USB/USB.h"
@@ -865,6 +866,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(CopyRoadMaximumBlendingLevel) &&
 		OpEqu(TextureFiltering) &&
 		OpEqu(TexturePreloading) &&
+		OpEqu(TextureUpscale) &&
 		OpEqu(GSDumpCompression) &&
 		OpEqu(HWDownloadMode) &&
 		OpEqu(CASMode) &&
@@ -1136,6 +1138,16 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(AccurateBlendingUnit, "accurate_blending_unit");
 	SettingsWrapIntEnumEx(TextureFiltering, "filter");
 	SettingsWrapIntEnumEx(TexturePreloading, "texture_preloading");
+	{
+		// Persisted as an integer, so a hand-edited or newer value must not become an invalid
+		// enumerator. Read as an int: the enum is a u8, and a stored 257 would wrap onto 1.
+		int texture_upscale = static_cast<int>(TextureUpscale);
+		SettingsWrapEntryEx(texture_upscale, "TextureUpscale");
+		if (texture_upscale < static_cast<int>(GSTextureUpscaleMode::Off) ||
+			texture_upscale > static_cast<int>(GSTextureUpscaleMode::Raisr4x))
+			texture_upscale = static_cast<int>(GSTextureUpscaleMode::Off);
+		TextureUpscale = static_cast<GSTextureUpscaleMode>(texture_upscale);
+	}
 	SettingsWrapIntEnumEx(GSDumpCompression, "GSDumpCompression");
 	SettingsWrapIntEnumEx(HWDownloadMode, "HWDownloadMode");
 	SettingsWrapIntEnumEx(CASMode, "CASMode");
@@ -2158,6 +2170,7 @@ Pcsx2Config::Pcsx2Config()
 	InhibitScreensaver = true;
 	UseSavestateSelector = true;
 	BackupSavestate = true;
+	McdAutoBackup = MemcardBackup::AutoBackupDefault(); // off where the front end has no backup screen of the shared kind
 	WarnAboutUnsafeSettings = true;
 	EnableDiscordPresence = false;
 	ManuallySetRealTimeClock = false;
@@ -2174,6 +2187,8 @@ Pcsx2Config::Pcsx2Config()
 
 	GzipIsoIndexTemplate = "$(f).pindex.tmp";
 	PINESlot = 28011;
+	AutosaveIntervalMinutes = 0;
+	AutosaveKeep = 3;
 	RtcYear = 0;
 	RtcMonth = 1;
 	RtcDay = 1;
@@ -2200,6 +2215,7 @@ void Pcsx2Config::LoadSaveCore(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableRecordingTools);
 	SettingsWrapBitBool(EnableGameFixes);
 	SettingsWrapBitBool(SaveStateOnShutdown);
+	SettingsWrapBitBool(AutosaveOnShutdown);
 	SettingsWrapBitBool(UseSavestateSelector);
 	SettingsWrapBitBool(EnableDiscordPresence);
 	SettingsWrapBitBool(InhibitScreensaver);
@@ -2231,6 +2247,8 @@ void Pcsx2Config::LoadSaveCore(SettingsWrapper& wrap)
 
 	SettingsWrapEntry(GzipIsoIndexTemplate);
 	SettingsWrapEntry(PINESlot);
+	SettingsWrapEntry(AutosaveIntervalMinutes);
+	SettingsWrapEntry(AutosaveKeep);
 	SettingsWrapEntry(RtcYear);
 	SettingsWrapEntry(RtcMonth);
 	SettingsWrapEntry(RtcDay);
@@ -2265,6 +2283,8 @@ void Pcsx2Config::LoadSave(SettingsWrapper& wrap)
 
 void Pcsx2Config::LoadSaveMemcards(SettingsWrapper& wrap)
 {
+	McdAutoBackup = wrap.EntryBitBool("MemoryCards", "AutoBackup", !!McdAutoBackup, McdAutoBackup);
+
 	for (uint slot = 0; slot < 2; ++slot)
 	{
 		wrap.Entry("MemoryCards", StringUtil::StdStringFromFormat("Slot%u_Enable", slot + 1).c_str(),

@@ -8,12 +8,14 @@
 #include "GS/Renderers/HW/GSLineRuns.h"
 #include "GS/Renderers/HW/GSPointPlace.h"
 #include "GS/Renderers/HW/GSSpriteEdgeSnap.h"
+#include "GS/Renderers/HW/GSTexelAddressedDraw.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "GS/Renderers/Common/GSAlphaBitLogicOp.h"
 #include "GS/Renderers/Common/GSBlendConstantPolicy.h"
 #include "GS/Renderers/Common/GSDrawRoad.h"
 #include "GS/Renderers/Common/GSFastStencilShadow.h"
 #include "GS/Renderers/Common/GSNativeTexelGridPolicy.h"
+#include "GS/Renderers/Common/GSReplacementAlphaSnap.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
@@ -127,11 +129,14 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 
 void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	if (GSTextureCache::IsHashMemoVerify()) [[unlikely]]
+		g_texture_cache->VerifyWriteStamps(m_mem);
+
 	// Retire whatever the GPU finished since the last frame. Runs unconditionally: after the
 	// mode is switched off there can still be a tail of queued downloads to drain.
 	g_texture_cache->ProcessPendingDownloads();
 
-	if (GSConfig.LoadTextureReplacements)
+	if (GSConfig.LoadTextureReplacements || GSConfig.TextureUpscale != GSTextureUpscaleMode::Off)
 		GSTextureReplacements::ProcessAsyncLoadedTextures();
 
 	if (!idle_frame)
@@ -2890,6 +2895,7 @@ void GSRendererHW::SwSpriteRender()
 		}
 	}
 
+	m_mem.MarkPagesWritten(dpo, m_r);
 	g_texture_cache->InvalidateVideoMem(dpo, m_r);
 }
 
@@ -9459,6 +9465,22 @@ __ri void GSRendererHW::EmulateTextureSampler(const GSTextureCache::Target* rt, 
 		m_cached_ctx.CLAMP.MAXV);
 
 	const bool need_mipmap = IsMipMapDraw();
+
+	// A draw that shows each texel of a generated upscale as a large block reads the guest's own
+	// texels instead (GSTexelAddressedDraw.h). The texture has the same normalised coordinates
+	// either way, so only the texture bound changes; the source keeps describing the upscale.
+	m_source_is_native_texels = false;
+	if (!m_channel_shuffle && !need_mipmap && !m_vt.IsLinear() && tex->m_from_hash_cache && tex->m_from_hash_cache->generated &&
+		DrawReadsTexelsAsColours())
+	{
+		if (GSTexture* native = g_texture_cache->GetNativeTexture(tex))
+		{
+			m_conf.tex = native;
+			m_source_is_native_texels = true;
+			GSTextureReplacements::NoteUpscaleNativeDraw();
+		}
+	}
+
 	const bool shader_emulated_sampler = tex->m_palette || (tex->m_target && !m_conf.ps.shuffle && cpsm.fmt != 0) ||
 	                                     complex_wms_wmt || psm.depth || target_region;
 	const bool can_trilinear = !tex->m_palette && !tex->m_target && !m_conf.ps.shuffle;
@@ -9828,6 +9850,69 @@ bool GSRendererHW::GetAgreedSpriteTexelSteps(GSNativeTexelStep& step_u, GSNative
 	}
 
 	return true;
+}
+
+bool GSRendererHW::DrawReadsTexelsAsColours() const
+{
+	if (m_vt.m_primclass != GS_TRIANGLE_CLASS && m_vt.m_primclass != GS_SPRITE_CLASS)
+		return false;
+
+	const bool sprite = (m_vt.m_primclass == GS_SPRITE_CLASS);
+	const u32 n = sprite ? 2 : 3;
+	const GSVertex* const v = m_vertex->buff;
+	const u16* const idx = m_index->buff;
+
+	// The same coordinates GSVertexTrace's min and max are taken from: positions in native pixels,
+	// texture coordinates in texels.
+	const bool fst = !!PRIM->FST;
+	const float offset_x = static_cast<float>(m_context->XYOFFSET.OFX);
+	const float offset_y = static_cast<float>(m_context->XYOFFSET.OFY);
+	const float texels_u = static_cast<float>(1 << m_context->TEX0.TW);
+	const float texels_v = static_cast<float>(1 << m_context->TEX0.TH);
+
+	GSTexelAddressedVote vote;
+	for (u32 i = 0; i + n <= m_index->tail; i += n)
+	{
+		float x[3], y[3], u[3], t[3];
+		for (u32 k = 0; k < n; k++)
+		{
+			const GSVertex& vertex = v[idx[i + k]];
+			x[k] = (static_cast<float>(vertex.XYZ.X) - offset_x) * (1.0f / 16.0f);
+			y[k] = (static_cast<float>(vertex.XYZ.Y) - offset_y) * (1.0f / 16.0f);
+			if (fst)
+			{
+				u[k] = static_cast<float>(vertex.U) * (1.0f / 16.0f);
+				t[k] = static_cast<float>(vertex.V) * (1.0f / 16.0f);
+			}
+			else
+			{
+				u[k] = vertex.ST.S / vertex.RGBAQ.Q * texels_u;
+				t[k] = vertex.ST.T / vertex.RGBAQ.Q * texels_v;
+			}
+		}
+
+		float dx = std::max(x[0], x[1]) - std::min(x[0], x[1]);
+		float dy = std::max(y[0], y[1]) - std::min(y[0], y[1]);
+		float du = std::max(u[0], u[1]) - std::min(u[0], u[1]);
+		float dv = std::max(t[0], t[1]) - std::min(t[0], t[1]);
+		double area = static_cast<double>(dx) * static_cast<double>(dy);
+		if (!sprite)
+		{
+			dx = std::max(dx, std::max(x[0], x[2]) - std::min(x[0], x[2]));
+			dx = std::max(dx, std::max(x[1], x[2]) - std::min(x[1], x[2]));
+			dy = std::max(dy, std::max(y[0], y[2]) - std::min(y[0], y[2]));
+			dy = std::max(dy, std::max(y[1], y[2]) - std::min(y[1], y[2]));
+			du = std::max(du, std::max(u[0], u[2]) - std::min(u[0], u[2]));
+			du = std::max(du, std::max(u[1], u[2]) - std::min(u[1], u[2]));
+			dv = std::max(dv, std::max(t[0], t[2]) - std::min(t[0], t[2]));
+			dv = std::max(dv, std::max(t[1], t[2]) - std::min(t[1], t[2]));
+			area = 0.5 * std::abs(static_cast<double>(x[1] - x[0]) * (y[2] - y[0]) - static_cast<double>(x[2] - x[0]) * (y[1] - y[0]));
+		}
+
+		vote.Add(area, GSPrimitiveMagnifiesTexels(du, dv, dx, dy));
+	}
+
+	return vote.Passes();
 }
 
 __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, const GSTextureCache::Target* ds,
@@ -11006,6 +11091,12 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	// Perform alpha test first pass setup here as bending depends on it.
 	EmulateAlphaTest(date_options);
 
+	// A pack texture's opaque alpha drifts off 0x80 (ASTC, or the upscaler); a test against 0x80 needs it back.
+	// Set before EmulateAlphaTestSecondPass copies ps, so the second pass snaps the same way.
+	m_conf.ps.replacement_alpha_snap = GSReplacementAlphaSnap::Wanted(
+		tex && tex->m_from_hash_cache && tex->m_from_hash_cache->is_replacement && !m_source_is_native_texels, m_cached_ctx.TEX0.TCC,
+		m_cached_ctx.TEST.ATE, m_cached_ctx.TEST.ATST, m_cached_ctx.TEST.AREF);
+
 	// AA1: Set alpha source to coverage 128 when AA1 is not supported.
 	m_conf.ps.fixed_one_a = IsCoverageAlphaFixedOne();
 
@@ -12115,6 +12206,7 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw)
 			{
 				current_page &= (GS_MAX_PAGES - 1);
+				m_mem.MarkPageRangeWritten(current_page, pages_wide);
 				GSVector4i* ptr = reinterpret_cast<GSVector4i*>(m_mem.vm8() + current_page * GS_PAGE_SIZE);
 				GSVector4i* const ptr_end = ptr + iterations_per_page;
 				if (drawing_mask)
@@ -12141,6 +12233,7 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw)
 			{
 				current_page &= (GS_MAX_PAGES - 1);
+				m_mem.MarkPageRangeWritten(current_page, pages_wide);
 				GSVector4i* ptr = reinterpret_cast<GSVector4i*>(m_mem.vm8() + current_page * GS_PAGE_SIZE);
 				GSVector4i* const ptr_end = ptr + iterations_per_page;
 				while (ptr != ptr_end)
@@ -12163,6 +12256,7 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw)
 			{
 				current_page &= (GS_MAX_PAGES - 1);
+				m_mem.MarkPageRangeWritten(current_page, pages_wide);
 				GSVector4i* ptr = reinterpret_cast<GSVector4i*>(m_mem.vm8() + current_page * GS_PAGE_SIZE);
 				GSVector4i* const ptr_end = ptr + iterations_per_page;
 				if (converted_mask)
@@ -12226,6 +12320,10 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 				vm[pa.value(x)] = converted_color | (vm[pa.value(x)] & converted_mask);
 		}
 	}
+
+	// The fast path marked its pages by the page numbers it stepped through, which come from the cached FRAME.FBW
+	// and can differ from off's width after a width change. This marks the rows written pixel by pixel.
+	m_mem.MarkPagesWritten(off, r);
 }
 
 bool GSRendererHW::OI_BlitFMV(GSTextureCache::Target* _rt, GSTextureCache::Source* tex, const GSVector4i& r_draw)

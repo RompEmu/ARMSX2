@@ -7,6 +7,7 @@
 #include "GS/Renderers/OpenGL/GLState.h"
 #include "GS/Renderers/Common/GSFramebufferFetchPolicy.h"
 #include "GS/Renderers/Common/GSGPUProfile.h"
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
 #include "GS/DriverReport/GSDriverReport.h"
 #include "GS/GSState.h"
 #include "GS/Renderers/Common/GSRenderer.h"
@@ -1013,6 +1014,11 @@ bool GSDeviceOGL::CheckFeatures()
 		static_cast<unsigned>(profile_selection.driver.matched_rule_count),
 		static_cast<unsigned long long>(profile_selection.driver.bugs),
 		static_cast<unsigned long long>(profile_selection.driver.workarounds));
+	Console.WriteLn("GL: GPU profile rules matched: %s",
+		GpuProfileDetector::DescribeMatchedRules(profile_selection.driver).c_str());
+	Console.WriteLn("GL: GPU profile bugs: %s", GpuProfileDetector::DescribeBugs(profile_selection.driver.bugs).c_str());
+	Console.WriteLn("GL: GPU profile workarounds: %s",
+		GpuProfileDetector::DescribeWorkarounds(profile_selection.driver.workarounds).c_str());
 	DevCon.WriteLn("GL: GPU profile hints: %s", profile_selection.hints.c_str());
 	bool use_mali_profile = IsMaliGPUProfile();
 	bool use_adreno_profile = IsAdrenoGPUProfile();
@@ -1785,7 +1791,9 @@ GSDevice::PresentResult GSDeviceOGL::DoBeginPresent(bool frame_skip)
 	// own FBO is not an option: FBOs are not shared between contexts, and this
 	// thread's context is a share of the frontend's rather than the same one.
 	// EndPresent publishes the finished texture, and retro_run blits it.
-	const bool libretro = GLLibretro::Active;
+	// Headless (GSHeadless) is the same present with no frontend to publish to; the host reads it back.
+	const bool libretro = GLLibretro::Active ||
+		(GSHeadless::IsEnabled() && m_window_info.type == WindowInfo::Type::Surfaceless);
 	if (!libretro && m_window_info.type == WindowInfo::Type::Surfaceless)
 		return PresentResult::FrameSkipped;
 
@@ -1867,6 +1875,10 @@ void GSDeviceOGL::EndPresent()
 
 		m_libretro_bb_idx = (m_libretro_bb_idx + 1) % kLibretroBackbuffers;
 		GLLibretro::PublishFrame(frame);
+	}
+	else if (GSHeadless::IsEnabled() && m_window_info.type == WindowInfo::Type::Surfaceless)
+	{
+		GSHeadless::NotePresented(m_libretro_bb[m_libretro_bb_idx].get());
 	}
 	else
 	{
@@ -2685,6 +2697,7 @@ std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 		+ fmt::format("#define PS_COLCLIP_HW {}\n", sel.colclip_hw)
 		+ fmt::format("#define PS_RTA_CORRECTION {}\n", sel.rta_correction)
 		+ fmt::format("#define PS_RTA_SRC_CORRECTION {}\n", sel.rta_source_correction)
+		+ fmt::format("#define PS_REPLACEMENT_ALPHA_SNAP {}\n", sel.replacement_alpha_snap)
 		+ fmt::format("#define PS_DITHER {}\n", sel.dither)
 		+ fmt::format("#define PS_DITHER_ADJUST {}\n", sel.dither_adjust)
 		+ fmt::format("#define PS_ZCLAMP {}\n", sel.zclamp)

@@ -554,6 +554,16 @@ public class NativeApp {
 	 *  or before first input) — solo play is unchanged. No-op with no vibrator. */
 	public static void onPadRumble(int pad, int largeMotor, int smallMotor) {
 		if (!sRumbleEnabled) return;
+		// Native calls this with no exception check (Native::onPadRumble), so nothing may escape:
+		// a throw would leave the IOP thread with a pending exception, which aborts the app at
+		// its next JNI call.
+		try {
+			rumblePlayer(pad, largeMotor, smallMotor);
+		} catch (Throwable ignored) {
+		}
+	}
+
+	private static void rumblePlayer(int pad, int largeMotor, int smallMotor) {
 		int devId = com.armsx2.input.PadRouter.INSTANCE.deviceIdForPort(pad);
 		// Nothing has claimed this slot yet: deal out the pads nobody has spoken for, rather
 		// than guessing. "The pad you last touched" names the SAME controller for every port,
@@ -570,7 +580,18 @@ public class NativeApp {
 		if (devId < 0 && pad != touchPad) return;
 		float low = Math.max(0f, Math.min(1f, largeMotor / 255f));   // low-frequency / large
 		float high = Math.max(0f, Math.min(1f, smallMotor / 255f));  // high-frequency / small
-		vibrateDevice(devId, low, high, RUMBLE_MS, pad == touchPad);
+		vibratePlayer(pad, devId, low, high, RUMBLE_MS, pad == touchPad);
+	}
+
+	/** [devId] and every other controller playing as [port] (PadRouter.otherDevicesForPort): a
+	 *  handheld's own controls and a pad for the TV can both be player 1, and both should feel
+	 *  it. Each goes where its own rumble setting says. The handheld's own motor, which several
+	 *  of them can fall back to, is driven once. */
+	private static void vibratePlayer(int port, int devId, float low, float high, int ms, boolean allowSystemFallback) {
+		boolean handheld = vibrateDevice(devId, low, high, ms, allowSystemFallback);
+		for (int other : com.armsx2.input.PadRouter.INSTANCE.otherDevicesForPort(port, devId)) {
+			handheld |= vibrateDevice(other, low, high, ms, allowSystemFallback && !handheld);
+		}
 	}
 
 	// ---- Achievement / notification sound playback ----
@@ -630,8 +651,9 @@ public class NativeApp {
 	/** Drive [devId]'s vibrator(s) with the PS2 large/high motor intensities for [ms].
 	 *  When the controller exposes no usable vibrator and [allowSystemFallback] is set,
 	 *  drive the device's own haptic motor instead (issue #241 — handhelds like the
-	 *  Odin 3 whose built-in gamepad has no rumble actuator, only system haptics). */
-	private static void vibrateDevice(int devId, float low, float high, int ms, boolean allowSystemFallback) {
+	 *  Odin 3 whose built-in gamepad has no rumble actuator, only system haptics).
+	 *  @return true when it drove the device's own haptic motor. */
+	private static boolean vibrateDevice(int devId, float low, float high, int ms, boolean allowSystemFallback) {
 		try {
 			InputDevice dev = (devId >= 0) ? InputDevice.getDevice(devId) : null;
 
@@ -642,7 +664,7 @@ public class NativeApp {
 			// player's rumble somewhere else" has to be sayable by hand.
 			com.armsx2.input.PadRouter.RumbleMode mode =
 				com.armsx2.input.PadRouter.INSTANCE.rumbleModeForDevice(devId);
-			if (mode == com.armsx2.input.PadRouter.RumbleMode.OFF) return;
+			if (mode == com.armsx2.input.PadRouter.RumbleMode.OFF) return false;
 			boolean forceDevice = mode == com.armsx2.input.PadRouter.RumbleMode.DEVICE;
 
 			// Single combined motor can't reproduce both PS2 actuators, so blend
@@ -664,7 +686,7 @@ public class NativeApp {
 					float scale = (Float.isFinite(sHapticScale) && sHapticScale >= 0f) ? sHapticScale : 1f;
 					int l = Math.round(Math.min(1f, low * scale) * 255f);
 					int h = Math.round(Math.min(1f, high * scale) * 255f);
-					if (usb.rumble(Math.max(0, l), Math.max(0, h))) return;
+					if (usb.rumble(Math.max(0, l), Math.max(0, h))) return false;
 				}
 				drove = driveMotors(motorsOf(dev), low, high, combined, ms);
 			}
@@ -682,10 +704,11 @@ public class NativeApp {
 			// object and buzzing it is exactly right.
 			if (!drove && allowSystemFallback
 				&& (forceDevice || sRumbleFallbackExternal || !isExternalPad(dev))) {
-				rumbleOne(systemVibrator(), combined, ms);
+				return rumbleOne(systemVibrator(), combined, ms);
 			}
 		} catch (Throwable ignored) {
 		}
+		return false;
 	}
 
 	/**
@@ -853,7 +876,7 @@ public class NativeApp {
 		if (devId < 0) devId = nthGamepadDeviceId(port);
 		// devId may stay -1 (touch-only / Odin built-in with no rumble); vibrateDevice
 		// then falls back to the device's own haptic so the test still buzzes (issue #241).
-		vibrateDevice(devId, 0.9f, 0.9f, 500, true);
+		vibratePlayer(port, devId, 0.9f, 0.9f, 500, true);
 	}
 
 	/** One-line report of [port]'s controller and whether Android exposes any vibrator
@@ -942,6 +965,10 @@ public class NativeApp {
 	 *  instead of OpenGL. The decision needs the driver-bug database (keyed on a parsed driver
 	 *  revision), which lives natively, so the app supplies the strings rather than the verdict. */
 	public static native void setAutoRendererGpuStrings(String vendor, String renderer, String version);
+	/** Whether the driver list offers malisx2 for this device's GPU (CustomDriver.offersMaliSX2).
+	 *  Pushed once at startup. The core pairs it with the driver the open Vulkan device is on and
+	 *  posts the "get malisx2" OSD notice at game start when that driver is not malisx2. */
+	public static native void setMaliSX2Offered(boolean offered);
 	/** Affinity Control Mode: 0 off (scheduler decides), 1-6 EE/VU/GS priority orders,
 	 *  7 Performance Cores. Read when the VM boots — set it before runVMThread. */
 	public static native void setAffinityMode(int mode);
@@ -968,6 +995,9 @@ public class NativeApp {
 	// resume rebuild). Set true right before pauseForOverlay's pause(); resume()
 	// clears it. See native setOutputPauseSuppressed / SPU2::SetOutputPauseSuppressed.
 	public static native void setOutputPauseSuppressed(boolean suppressed);
+	// From the activity's onStop (true) and onStart (false). Out of sight, a paused game lets go of
+	// the audio device even across an overlay pause, and the paused CPU thread stops polling.
+	public static native void setAppBackgrounded(boolean backgrounded);
 	public static native void shutdown();
 	public static native boolean hasActiveVM();
 
@@ -1055,12 +1085,17 @@ public class NativeApp {
 	// in the savestate folder (see VMManager::SAVESTATE_SLOT_AUTOSAVE) so the
 	// numbered slots 0-9 stay user-controlled. saveAutosaveState is called
 	// from the in-game "Save State And Exit" menu; hasAutosaveState gates
-	// the load picker's autosave tile.
-	public static native boolean saveAutosaveState();
+	// the load picker's autosave tile. That file is the newest autosave: saving moves the ones
+	// before it a place older, keeping `keep` (1-5) in all; the *At(n) calls reach the n-th newest
+	// (1 = the newest, 2 the one before it...) for the picker's tiles, null / false when there is none.
+	public static native boolean saveAutosaveState(int keep);
 	public static native boolean loadAutosaveState();
 	public static native boolean hasAutosaveState();
 	public static native byte[] getAutosaveImage();
 	public static native String getAutosaveGamePath();
+	public static native String getAutosavePathAt(int n);
+	public static native byte[] getAutosaveImageAt(int n);
+	public static native boolean loadAutosaveStateAt(int n);
 	// Frames the GS has presented since it opened (host-side, not saved in the state). The
 	// auto-load-on-boot path waits until this is advancing before restoring, so the load happens
 	// once the renderer is actually presenting — otherwise the restored frame never reaches the
