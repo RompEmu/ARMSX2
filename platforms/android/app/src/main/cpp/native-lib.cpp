@@ -12,6 +12,7 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/Elfheader.h" // ElfObject, for the boot-ELF disc pairing
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/CDVD/IsoReader.h" // ISO extraction for host: quick-loading setups
@@ -2145,13 +2146,15 @@ Java_kr_co_iefriends_pcsx2_NativeApp_commitSettings(JNIEnv *env, jclass clazz) {
     // allow forwarding references (T&&) to bind to bit-fields.
     Console.WriteLnFmt(
         "Settings commit: vuThread={} EECycleRate={} EECycleSkip={} "
-        "vu1Instant={} fastCDVD={} vuFlagHack={}",
+        "vu1Instant={} fastCDVD={} vuFlagHack={} iopThread={} iopThreadLag={}",
         +EmuConfig.Speedhacks.vuThread,
         +EmuConfig.Speedhacks.EECycleRate,
         +EmuConfig.Speedhacks.EECycleSkip,
         +EmuConfig.Speedhacks.vu1Instant,
         +EmuConfig.Speedhacks.fastCDVD,
-        +EmuConfig.Speedhacks.vuFlagHack);
+        +EmuConfig.Speedhacks.vuFlagHack,
+        +EmuConfig.Speedhacks.iopThread,
+        EmuConfig.Speedhacks.iopThreadLag);
 }
 
 // Generic live GS reconfigure. Reloads the whole EmuCore/GS section from the
@@ -2355,17 +2358,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_enablePad2(JNIEnv *env, jclass clazz) {
     ScopedVMPause vm_pause(false);
     if (!vm_pause.parked())
         return;
-    {
-        auto lock = Host::GetSettingsLock();
-        if (SettingsInterface* si = Host::GetSettingsInterface()) {
-            si->SetStringValue("Pad2", "Type", "DualShock2");
-            si->SetFloatValue("Pad2", "Deadzone", 0.0f);        // app shapes the stick (shapeStickMag)
-            si->SetFloatValue("Pad2", "AxisScale", 1.33f);      // PCSX2 default
-            si->SetFloatValue("Pad2", "ButtonDeadzone", 0.0f);
-        }
-    }
+    // Into the BASE layer, as setSetting and setMultitap write. Host::GetSettingsInterface() is the
+    // layered view and every setter on it is a pxFailRel: writing through it aborted the app the
+    // moment a second pad was plugged in with a game running, which is why hot-plug was switched off.
+    // Remote play (a friend as player 2) needs the port, so it is safe again. The SetBase* calls lock
+    // for themselves.
+    Host::SetBaseStringSettingValue("Pad2", "Type", "DualShock2");
+    Host::SetBaseFloatSettingValue("Pad2", "Deadzone", 0.0f);        // app shapes the stick (shapeStickMag)
+    Host::SetBaseFloatSettingValue("Pad2", "AxisScale", 1.33f);      // PCSX2 default
+    Host::SetBaseFloatSettingValue("Pad2", "ButtonDeadzone", 0.0f);
     {
         std::lock_guard<std::mutex> lk(s_pad_mutex);
+        // Held across the reload, as setMultitap does: pad mutex first, then the settings lock, the
+        // order ApplyUsbPortsToRunningVM takes them in.
+        auto settings_lock = Host::GetSettingsLock();
         EmuConfig.Pad.Ports[1].Type = Pad::ControllerType::DualShock2;
         Pad::LoadConfig(*Host::GetSettingsInterface());
     }
@@ -4838,6 +4844,7 @@ void Host::OnSaveStateSaved(const std::string_view filename)
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
 {
+    BLOCKING_HOST_CALL_ASSERT(block);
     const std::thread::id current_thread = std::this_thread::get_id();
     std::mutex wait_mutex;
     std::condition_variable wait_cv;
