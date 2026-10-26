@@ -1513,14 +1513,15 @@ VkRenderPass GSDeviceVK::GetRenderPassForRestarting(VkRenderPass pass)
 		if (it.second != pass)
 			continue;
 
+		// The restarted pass continues the one that was open, so it loads what that pass drew. A
+		// DONT_CARE kept from the first opening (an invalidated target) throws it away instead: on a
+		// tiler the pass then starts from undefined tile memory and stores it over everything drawn
+		// before the restart.
 		RenderPassCacheKey modified_key;
 		modified_key.key = it.first;
-		if (modified_key.color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.depth_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.stencil_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 
 		if (modified_key.key == it.first)
 			return pass;
@@ -2151,6 +2152,11 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 
 			return;
 		}
+
+		// The surface turned (device rotated, window moved to a display mounted the other way):
+		// rebuild with the new pre-rotation next frame. Other SUBOPTIMALs keep the swap chain.
+		if (res == VK_SUBOPTIMAL_KHR && present_swap_chain->HasSurfaceRotationChanged())
+			m_resize_requested = true;
 
 		// Grab the next image as soon as possible, that way we spend less time blocked on the next
 		// submission. Don't care if it fails, we'll deal with that at the presentation call site.
@@ -3313,6 +3319,11 @@ bool GSDeviceVK::SupportsExclusiveFullscreen() const
 	return false;
 }
 
+DisplayRotation GSDeviceVK::GetSurfacePreRotation() const
+{
+	return m_swap_chain ? m_swap_chain->GetPreRotation() : DisplayRotation::Rot0;
+}
+
 void GSDeviceVK::DestroySurface()
 {
 	WaitForGPUIdle();
@@ -3460,9 +3471,12 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 
 	// SUBOPTIMAL is a success: the image is acquired and presentable. Adreno returns it when the
 	// compositor changes state (the touch overlay redrawing), and rebuilding the swap chain for it
-	// blanks the window. Rebuilding would not clear it either, since preTransform stays identity.
-	// Real size changes arrive as a host resize, an Android surface change, or OUT_OF_DATE.
+	// blanks the window, so it is rebuilt only when the surface's rotation changed (the swap chain
+	// is pre-rotated to it; see VKSwapChain::GetPreRotation). Real size changes arrive as a host
+	// resize, an Android surface change, or OUT_OF_DATE.
 	VkResult res = m_resize_requested ? VK_ERROR_OUT_OF_DATE_KHR : m_swap_chain->AcquireNextImage();
+	if (res == VK_SUBOPTIMAL_KHR && m_swap_chain->HasSurfaceRotationChanged())
+		m_resize_requested = true;
 	if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
 	{
 		m_swap_chain->ReleaseCurrentImage();
@@ -4104,7 +4118,7 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.driver_orders_declared_loop = GetMobileDriverProfile().orders_declared_feedback_loop &&
 		(!order_on_request || m_optional_extensions.vk_ext_rasterization_order_attachment_access);
 	// The database saying this part belongs on the declared loop with our own barriers kept: Turnip on
-	// Adreno 730 and up, where the copy road renders wrong.
+	// Adreno 730 and up and on the 722, where the copy road renders wrong.
 	road_inputs.driver_prefers_declared_loop_with_barriers =
 		GetMobileDriverProfile().prefers_declared_loop_with_barriers;
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
@@ -4237,6 +4251,8 @@ void GSDeviceVK::ResolveFeatureTable()
 	// does it through GpuProfileDetector::SetForcedBugs, which is already folded into the profile
 	// by the time this reads it.
 	m_features.broken_blend_constant = GetMobileDriverProfile().HasBug(DriverBug::BrokenBlendConstant);
+
+	m_features.native_counter_draws = true;
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
@@ -5029,16 +5045,17 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 	DrawStretchRect(sRect, dRect, size);
 }
 
-// Rotate a logical-NDC point (x, y) into physical-NDC by GSConfig.Rotation.
-// Used by the present pass to map a quad laid out for a logically-rotated
-// window onto the unrotated swapchain viewport.
+// Rotate a logical-NDC point (x, y) into physical-NDC by `rotation`, the present rotation
+// (the user's DisplayRotation plus the swap chain pre-rotation, GSDevice::GetPresentRotation).
+// Used by the present pass to map a quad laid out for the logical window onto the swap chain
+// image.
 //   Rot0:   (x,  y)
 //   Rot90:  (y, -x)   (image rotates 90° CW on the panel)
 //   Rot180: (-x,-y)
 //   Rot270: (-y, x)   (image rotates 90° CCW on the panel)
-static void RotateNDCForPresent(float& x, float& y)
+static void RotateNDCForPresent(DisplayRotation rotation, float& x, float& y)
 {
-	switch (GSConfig.Rotation)
+	switch (rotation)
 	{
 		case DisplayRotation::Rot90:
 		{
@@ -5082,16 +5099,17 @@ void GSDeviceVK::DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect,
 	// Present pass: map logical-NDC (computed against the rotated window) onto
 	// the unrotated physical swapchain viewport. Non-present passes pass the
 	// real dst-texture size in `ds` and must not rotate.
-	if (m_is_presenting && GSConfig.Rotation != DisplayRotation::Rot0)
+	const DisplayRotation rotation = m_is_presenting ? GetPresentRotation() : DisplayRotation::Rot0;
+	if (rotation != DisplayRotation::Rot0)
 	{
 		float tlx = left, tly = top;
 		float trx = right, try_ = top;
 		float blx = left, bly = bottom;
 		float brx = right, bry = bottom;
-		RotateNDCForPresent(tlx, tly);
-		RotateNDCForPresent(trx, try_);
-		RotateNDCForPresent(blx, bly);
-		RotateNDCForPresent(brx, bry);
+		RotateNDCForPresent(rotation, tlx, tly);
+		RotateNDCForPresent(rotation, trx, try_);
+		RotateNDCForPresent(rotation, blx, bly);
+		RotateNDCForPresent(rotation, brx, bry);
 
 		const GSVertexPT1 vertices[] = {
 			{GSVector4(tlx, tly, 0.5f, 1.0f), GSVector2(sRect.x, sRect.y)},
@@ -6931,9 +6949,10 @@ void GSDeviceVK::RenderImGui()
 	// uScale/uTranslate map pixel coords directly to NDC. Rotation transforms
 	// logical pixels into the physical pixel space of the swapchain viewport,
 	// so uScale must always be in physical units (not logical) for both the
-	// rotated and unrotated paths.
-	const float phys_w = static_cast<float>(m_window_info.surface_width);
-	const float phys_h = static_cast<float>(m_window_info.surface_height);
+	// rotated and unrotated paths. Physical is the swap chain image, whose axes
+	// are swapped from the window's under a 90/270 pre-rotation.
+	const float phys_w = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageWidth() : m_window_info.surface_width);
+	const float phys_h = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageHeight() : m_window_info.surface_height);
 	const GSVector4 uniforms(2.0f / phys_w, 2.0f / phys_h, -1.0f, -1.0f);
 
 	SetUtilityPushConstants(&uniforms, sizeof(uniforms));
@@ -6952,34 +6971,21 @@ void GSDeviceVK::RenderImGui()
 	// maps a logical pixel (lx, ly) on a (lw, lh) logical surface to a
 	// physical pixel on the (phys_w, phys_h) swapchain. Rotation is around
 	// the geometric centre of each surface.
-	const bool rotate = (GSConfig.Rotation != DisplayRotation::Rot0);
+	const DisplayRotation rotation = GetPresentRotation();
+	const bool rotate = (rotation != DisplayRotation::Rot0);
 	const GSVector2i pres = GetPresentationSize();
 	const float lw = static_cast<float>(pres.x);
 	const float lh = static_cast<float>(pres.y);
+	// The turn is RotateNDCForPresent's, the one the game image gets. That works in y-up
+	// coordinates (the present vertex shader flips y) and ImGui's pixels are y-down, so y is
+	// flipped around it; applying the same formula to y-down pixels turns the overlay the other
+	// way, 180 degrees off the game at Rot90/Rot270.
 	const auto rotate_pixel = [&](float lx, float ly, float& px, float& py) {
-		const float lcx = lx - lw * 0.5f;
-		const float lcy = ly - lh * 0.5f;
-		float pcx = lcx;
-		float pcy = lcy;
-		switch (GSConfig.Rotation)
-		{
-			case DisplayRotation::Rot90:
-				pcx = lcy;
-				pcy = -lcx;
-				break;
-			case DisplayRotation::Rot180:
-				pcx = -lcx;
-				pcy = -lcy;
-				break;
-			case DisplayRotation::Rot270:
-				pcx = -lcy;
-				pcy = lcx;
-				break;
-			default:
-				break;
-		}
-		px = pcx + phys_w * 0.5f;
-		py = pcy + phys_h * 0.5f;
+		float x = lx - lw * 0.5f;
+		float y = lh * 0.5f - ly;
+		RotateNDCForPresent(rotation, x, y);
+		px = x + phys_w * 0.5f;
+		py = phys_h * 0.5f - y;
 	};
 
 	for (int n = 0; n < draw_data->CmdLists.Size; n++)
@@ -8418,9 +8424,18 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
 	GSTexture* const current_rt = m_current_render_target;
 	GSTexture* const current_ds = m_current_depth_target;
 	const FeedbackLoopFlag current_feedback_loop = m_current_framebuffer_feedback_loop;
+	// Callers restart in the middle of a draw whose textures are already bound, then re-apply its
+	// state. Moving to the next command buffer resets every texture slot to the null texture, which
+	// would draw the rest of that draw untextured, so carry the bindings across. They stay valid:
+	// a texture unbinds itself when destroyed.
+	const std::array<GSTextureVK*, NUM_TFX_TEXTURES> tfx_textures = m_tfx_textures;
+	const GSTextureVK* const utility_texture = m_utility_texture;
 
 	EndRenderPass();
 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
+
+	m_tfx_textures = tfx_textures;
+	m_utility_texture = utility_texture;
 
 	if (render_pass != VK_NULL_HANDLE)
 	{
@@ -9347,6 +9362,26 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	GSTextureVK* draw_rt_clone = nullptr;
 	GSTextureVK* colclip_rt = static_cast<GSTextureVK*>(g_gs_device->GetColorClipTexture());
 
+	// A counter draw the renderer asked to have drawn at native resolution (GSHWDrawConfig::colclip_native_scale):
+	// the colclip target, and a point-sampled copy of the depth buffer it tests against, are made at the target's
+	// size divided by its scale, and the resolve stretches the result back with point sampling. Only a fresh
+	// convert-and-resolve draw qualifies, since an existing colclip target already has the full size.
+	const bool native = config.colclip_native_scale > 1.0f && config.ps.colclip_hw && !colclip_rt &&
+	                    config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve && config.rt &&
+	                    config.rt->GetState() == GSTexture::State::Dirty;
+	const float native_div = native ? config.colclip_native_scale : 1.0f;
+	const GSVector2i draw_size = native ?
+		GSVector2i(static_cast<int>(std::ceil(rtsize.x / native_div)), static_cast<int>(std::ceil(rtsize.y / native_div))) :
+		rtsize;
+	const auto to_draw_size = [native, native_div](const GSVector4i& r) {
+		if (!native)
+			return r;
+		return GSVector4i(static_cast<int>(std::floor(r.x / native_div)), static_cast<int>(std::floor(r.y / native_div)),
+			static_cast<int>(std::ceil(r.z / native_div)), static_cast<int>(std::ceil(r.w / native_div)));
+	};
+	GSTextureVK* const full_ds = draw_ds;
+	GSTextureVK* native_ds = nullptr;
+
 	// stream buffer in first, in case we need to exec
 	SetVSConstantBuffer(config.cb_vs);
 	SetPSConstantBuffer(config.cb_ps);
@@ -9496,7 +9531,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 			EndRenderPass();
-			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false));
+			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(draw_size.x, draw_size.y, GSTexture::Format::ColorClip, false));
 			if (!colclip_rt)
 			{
 				Console.Warning("VK: Failed to allocate ColorClip render target, aborting draw.");
@@ -9537,6 +9572,25 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 						   (config.ds && static_cast<GSTextureVK*>(config.ds) == m_tfx_textures[0])))
 	{
 		PSSetShaderResource(0, nullptr, false);
+	}
+
+	if (native && full_ds)
+	{
+		// DoStretchRect, not StretchRect: the latter flushes deferred draws, and this is one of them.
+		// The depth-output flag is what makes the copy write depth at all.
+		EndRenderPass();
+		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true));
+		if (!native_ds)
+		{
+			Console.Warning("VK: Failed to allocate native-resolution depth buffer, aborting draw.");
+			Recycle(colclip_rt);
+			g_gs_device->SetColorClipTexture(nullptr);
+			GL_POP();
+			return;
+		}
+		DoStretchRect(static_cast<GSTexture*>(full_ds), GSVector4(0, 0, 1, 1), static_cast<GSTexture*>(native_ds),
+			GSVector4(GSVector4i::loadh(draw_size)), ShaderConvertSelector(ShaderConvert::DEPTH_COPY, 0xf, true), Nearest);
+		draw_ds = native_ds;
 	}
 
 	// render pass restart optimizations
@@ -9660,7 +9714,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	
 	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
-	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
@@ -9690,8 +9744,8 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		// microseconds per PASS, and a narrower area only forces more of them. Commit f9b5395855 has
 		// the mechanism this reverted, and the measurements behind these numbers.
 		const GSVector4i render_area = (pipe.ps.colclip_hw && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && ds_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
-		                             ? config.drawarea
-		                             : GSVector4i::loadh(rtsize);
+		                             ? to_draw_size(config.drawarea)
+		                             : GSVector4i::loadh(draw_size);
 
 		if (is_clearing_rt)
 		{
@@ -9738,16 +9792,16 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	// rt -> colclip hw blit if enabled
 	if (colclip_rt && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly || config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && config.rt->GetState() == GSTexture::State::Dirty)
 	{
-		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(rtsize), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(draw_size), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 		SetUtilityTexture(static_cast<GSTextureVK*>(config.rt), m_point_sampler);
 		SetPipeline(m_colclip_setup_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
 
 		const GSVector4 drawareaf = GSVector4((config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly) ? GSVector4i::loadh(rtsize) : config.drawarea);
 		const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
-		DrawStretchRect(sRect, drawareaf, rtsize);
+		DrawStretchRect(sRect, native ? GSVector4(to_draw_size(config.drawarea)) : drawareaf, draw_size);
 
 		GL_POP();
-		OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 	}
 
 	// VB/IB upload, if we did DATE setup and it's not colclip hw this has already been done
@@ -9835,7 +9889,15 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	if (date_image)
 		Recycle(date_image);
 
-	// now blit the colclip texture back to the original target
+	if (native_ds)
+	{
+		EndRenderPass();
+		draw_ds = full_ds;
+		Recycle(native_ds);
+	}
+
+	// now blit the colclip texture back to the original target. The source rectangle is normalised, so a
+	// native-resolution colclip target needs nothing different here.
 	if (colclip_rt)
 	{
 		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);

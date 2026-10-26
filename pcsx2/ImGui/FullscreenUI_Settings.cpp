@@ -219,6 +219,14 @@ void FullscreenUI::SetSettingsChanged(SettingsInterface* bsi)
 		s_settings_changed.store(true, std::memory_order_release);
 }
 
+void FullscreenUI::SetSettingsChanged(SettingsInterface* bsi, const char* section, const char* key)
+{
+	// Read from the base layer directly: callers hold the settings lock, which is not recursive.
+	if (IsEditingGameSettings(bsi))
+		AutoTune::DisableForManualChange(*bsi, section, key, Host::Internal::GetBaseSettingsLayer()->GetBoolValue("EmuCore", "AutoTune", false));
+	SetSettingsChanged(bsi);
+}
+
 bool FullscreenUI::GetEffectiveBoolSetting(SettingsInterface* bsi, const char* section, const char* key, bool default_value)
 {
 	if (IsEditingGameSettings(bsi))
@@ -513,7 +521,7 @@ bool FullscreenUI::DrawToggleSetting(SettingsInterface* bsi, const char* title, 
 			bsi->DeleteValue(section, key);
 	}
 
-	SetSettingsChanged(bsi);
+	SetSettingsChanged(bsi, section, key);
 	return true;
 }
 
@@ -566,7 +574,7 @@ void FullscreenUI::DrawIntListSetting(SettingsInterface* bsi, const char* title,
 						bsi->SetIntValue(section, key, index + option_offset);
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -623,7 +631,7 @@ void FullscreenUI::DrawIntRangeSetting(SettingsInterface* bsi, const char* title
 			else
 				bsi->SetIntValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		ImGui::PopStyleColor(7);
@@ -758,7 +766,7 @@ void FullscreenUI::DrawIntSpinBoxSetting(SettingsInterface* bsi, const char* tit
 			else
 				bsi->SetIntValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		if (MenuButtonWithoutSummary(FSUI_CSTR("OK"), true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY, g_large_font, ImVec2(0.5f, 0.0f)))
@@ -826,7 +834,7 @@ void FullscreenUI::DrawFloatRangeSetting(SettingsInterface* bsi, const char* tit
 			else
 				bsi->SetFloatValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		ImGui::PopStyleColor(7);
@@ -966,7 +974,7 @@ void FullscreenUI::DrawFloatSpinBoxSetting(SettingsInterface* bsi, const char* t
 			else
 				bsi->SetFloatValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		if (MenuButtonWithoutSummary(FSUI_CSTR("OK"), true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY, g_large_font, ImVec2(0.5f, 0.0f)))
@@ -1230,7 +1238,7 @@ void FullscreenUI::DrawStringListSetting(SettingsInterface* bsi, const char* tit
 						bsi->SetStringValue(section, key, option_values_copy[index].c_str());
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1274,7 +1282,7 @@ void FullscreenUI::DrawStringListSetting(SettingsInterface* bsi, const char* tit
 						bsi->SetStringValue(section, key, raw_options[index].first.c_str());
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1344,7 +1352,7 @@ void FullscreenUI::DrawFloatListSetting(SettingsInterface* bsi, const char* titl
 						bsi->SetFloatValue(section, key, option_values[index]);
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1395,7 +1403,7 @@ void FullscreenUI::DrawEnumSetting(SettingsInterface* bsi, const char* title, co
 						bsi->SetStringValue(section, key, to_string_function(static_cast<DataType>(index)));
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -2707,7 +2715,7 @@ void FullscreenUI::DrawEmulationSettingsPage()
 		"EmuCore/Speedhacks", "iopThread", false);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
 		FSUI_CSTR("When a game keeps missing frames, tries performance settings one at a time and keeps the ones that help, saved per game."),
-		"EmuCore", "AutoTune", true);
+		"EmuCore", "AutoTune", false);
 #ifdef ARCH_ARM64 // vu-aot is part of the ARM64 recompilers only
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MICROCHIP, "Enable VU1 Ahead-of-Time Compiler"),
 		FSUI_CSTR("Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache."),
@@ -3203,6 +3211,9 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MAXIMIZE, "Show Overscan"),
 		FSUI_CSTR("Enables the option to show the overscan area on games which draw more than the safe area of the screen."), "EmuCore/GS",
 		"pcrtc_overscan", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_CROP, "Trim Upscaled Edges"),
+		FSUI_CSTR("Crops one PS2 pixel from each edge of the picture when upscaling 2x or higher, hiding the garbage that often appears there."),
+		"EmuCore/GS", "TrimUpscaledEdges", true);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_GLASSES, "Anti-Blur"),
 		FSUI_CSTR("Enables internal Anti-Blur hacks. Less accurate than PS2 rendering but will make a lot of games look less blurry."),
 		"EmuCore/GS", "pcrtc_antiblur", true);
@@ -6909,6 +6920,8 @@ TRANSLATE_NOOP("FullscreenUI", "Integer Scaling");
 TRANSLATE_NOOP("FullscreenUI", "Screen Offsets");
 TRANSLATE_NOOP("FullscreenUI", "Show Overscan");
 TRANSLATE_NOOP("FullscreenUI", "Anti-Blur");
+TRANSLATE_NOOP("FullscreenUI", "Trim Upscaled Edges");
+TRANSLATE_NOOP("FullscreenUI", "Crops one PS2 pixel from each edge of the picture when upscaling 2x or higher, hiding the garbage that often appears there.");
 TRANSLATE_NOOP("FullscreenUI", "Internal Resolution");
 TRANSLATE_NOOP("FullscreenUI", "Texture Filtering");
 TRANSLATE_NOOP("FullscreenUI", "Trilinear Filtering");

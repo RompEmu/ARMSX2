@@ -774,9 +774,11 @@ Pcsx2Config::GSOptions::GSOptions()
 
 	PCRTCAntiBlur = true;
 	DisableInterlaceOffset = false;
+	MovieCombDeinterlace = false;
 	PCRTCOffsets = false;
 	PCRTCOverscan = false;
 	IntegerScaling = false;
+	TrimUpscaledEdges = true;
 	LinearPresent = GSPostBilinearMode::BilinearSmooth;
 	UseDebugDevice = false;
 	UseBlitSwapChain = false;
@@ -838,6 +840,7 @@ Pcsx2Config::GSOptions::GSOptions()
 	UserHacks_ForceEvenSpritePosition = false;
 	UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 	UserHacks_NativePaletteDraw = false;
+	UserHacks_NativeCounterDraws = false;
 
 	DumpReplaceableTextures = false;
 	DumpReplaceableMipmaps = false;
@@ -1064,9 +1067,11 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	// using these variables, we need to use the old names. Maybe post 2.0 we can change this.
 	SettingsWrapBitBoolEx(PCRTCAntiBlur, "pcrtc_antiblur");
 	SettingsWrapBitBoolEx(DisableInterlaceOffset, "disable_interlace_offset");
+	SettingsWrapBitBoolEx(MovieCombDeinterlace, "movie_comb_deinterlace");
 	SettingsWrapBitBoolEx(PCRTCOffsets, "pcrtc_offsets");
 	SettingsWrapBitBoolEx(PCRTCOverscan, "pcrtc_overscan");
 	SettingsWrapBitBool(IntegerScaling);
+	SettingsWrapBitBool(TrimUpscaledEdges);
 	SettingsWrapBitBool(UseDebugDevice);
 	SettingsWrapBitBool(DebugLabels);
 	SettingsWrapBitBool(DumpDrawLog);
@@ -1120,6 +1125,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBoolEx(UserHacks_ForceEvenSpritePosition, "UserHacks_ForceEvenSpritePosition");
 	SettingsWrapIntEnumEx(UserHacks_BilinearHack, "UserHacks_BilinearHack");
 	SettingsWrapBitBoolEx(UserHacks_NativePaletteDraw, "UserHacks_NativePaletteDraw");
+	SettingsWrapBitBoolEx(UserHacks_NativeCounterDraws, "UserHacks_NativeCounterDraws");
 	SettingsWrapIntEnumEx(UserHacks_TextureInsideRt, "UserHacks_TextureInsideRt");
 	SettingsWrapIntEnumEx(UserHacks_Limit24BitDepth, "UserHacks_Limit24BitDepth");
 	SettingsWrapBitBoolEx(UserHacks_EstimateTextureRegion, "UserHacks_EstimateTextureRegion");
@@ -1329,9 +1335,10 @@ void Pcsx2Config::GSOptions::MaskUserHacks(bool respect_claims)
 	if (!keep(GSUserHackOverride::RewriteLargeST))
 		UserHacks_RewriteLargeSTCoords = false;
 
-	// No UI reaches these two, so there is nothing for a player to claim.
+	// No UI reaches these, so there is nothing for a player to claim.
 	UserHacks_DisableSafeFeatures = false;
 	UserHacks_DisableRenderFixes = false;
+	UserHacks_NativeCounterDraws = false;
 	SkipDrawStart = 0;
 	SkipDrawEnd = 0;
 }
@@ -1366,6 +1373,8 @@ void Pcsx2Config::GSOptions::MaskUpscalingHacks()
 		note("bilinearUpscale");
 	if (UserHacks_NativePaletteDraw)
 		note("nativePaletteDraw");
+	if (UserHacks_NativeCounterDraws)
+		note("nativeCounterDraws");
 	if (UserHacks_HalfPixelOffset != GSHalfPixelOffset::Off)
 		note("halfPixelOffset");
 	if (UserHacks_RoundSprite != 0)
@@ -1382,6 +1391,7 @@ void Pcsx2Config::GSOptions::MaskUpscalingHacks()
 	UserHacks_ForceEvenSpritePosition = false;
 	UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 	UserHacks_NativePaletteDraw = false;
+	UserHacks_NativeCounterDraws = false;
 	UserHacks_HalfPixelOffset = GSHalfPixelOffset::Off;
 	UserHacks_RoundSprite = 0;
 	UserHacks_NativeScaling = GSNativeScaling::Off;
@@ -2200,12 +2210,13 @@ Pcsx2Config::Pcsx2Config()
 	EnableFastBoot = true;
 	EnableRecordingTools = true;
 	EnableGameFixes = true;
+	EnablePrimeCorePlacement = true;
 	InhibitScreensaver = true;
 	UseSavestateSelector = true;
 	BackupSavestate = true;
 	McdAutoBackup = MemcardBackup::AutoBackupDefault(); // off where the front end has no backup screen of the shared kind
 	WarnAboutUnsafeSettings = true;
-	AutoTune = true;
+	AutoTune = false;
 	EnableDiscordPresence = false;
 	ManuallySetRealTimeClock = false;
 	UseSystemLocaleFormat = false;
@@ -2246,6 +2257,7 @@ void Pcsx2Config::LoadSaveCore(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableFastBoot);
 	SettingsWrapBitBool(EnableFastBootFastForward);
 	SettingsWrapBitBool(EnableThreadPinning);
+	SettingsWrapBitBool(EnablePrimeCorePlacement);
 	SettingsWrapBitBool(EnableRecordingTools);
 	SettingsWrapBitBool(EnableGameFixes);
 	SettingsWrapBitBool(SaveStateOnShutdown);

@@ -686,11 +686,12 @@ fun HomeScreen(
                                         Spacer(Modifier.height(6.dp))
                                         (listOf<String?>(null) + com.armsx2.GameCategories.names()).forEach { name ->
                                             val label = name ?: allLabel
+                                            val focusId = name?.let { "category-pick-$it" } ?: "category-pick"
                                             Row(
                                                 Modifier
                                                     .fillMaxWidth()
                                                     .clip(RoundedCornerShape(10.dp))
-                                                    .controllerFocusable("category-pick-${'$'}label", RoundedCornerShape(10.dp),
+                                                    .controllerFocusable(focusId, RoundedCornerShape(10.dp),
                                                         onConfirm = { viewModel.setCategoryFilter(name); picking = false })
                                                     .combinedClickable(
                                                         onClick = { viewModel.setCategoryFilter(name); picking = false },
@@ -911,7 +912,14 @@ fun HomeScreen(
                     if (com.armsx2.ArcadeOnly.enabled.value && state.query.isBlank()) {
                         arcadeOnlyEmpty { viewModel.setArcadeOnly(false) }
                     } else {
-                        emptyLibrary(state.query.isBlank())
+                        val reason = when {
+                            state.query.isNotBlank() -> EmptyLibraryReason.Searching
+                            directories.isEmpty() -> EmptyLibraryReason.NoFolders
+                            state.allGames.isNotEmpty() -> EmptyLibraryReason.Filtered
+                            state.error != null -> EmptyLibraryReason.ScanFailed
+                            else -> EmptyLibraryReason.NoGames
+                        }
+                        emptyLibrary(reason)
                     }
                 } else if (state.layout == LibraryLayout.Shelf) {
                     // Fill each plank: chunk by how many covers fit the shelf width.
@@ -1160,8 +1168,11 @@ fun HomeScreen(
                 val addToHomeFailed = str("games.addToHome.unsupported")
                 GameMenuAction("📌", str("games.addToHome"), "game-menu.pin") {
                     menuGame = null
-                    if (!com.armsx2.HomeShortcuts.pin(context, game))
-                        Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    // pin() fetches the cover first, normally from the library's image cache.
+                    scope.launch {
+                        if (!com.armsx2.HomeShortcuts.pin(context, game))
+                            Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    }
                 }
                 // Only offered when the game is actually in Recently Played — this drops
                 // just this one entry, unlike the library-wide "Show Recently Played" toggle.
@@ -1939,13 +1950,23 @@ private fun LibraryOverflowItem(
     )
 }
 
-private fun LazyGridScope.emptyLibrary(noFolders: Boolean) {
+private enum class EmptyLibraryReason { Searching, NoFolders, Filtered, ScanFailed, NoGames }
+
+private fun LazyGridScope.emptyLibrary(reason: EmptyLibraryReason) {
     item(span = { GridItemSpan(maxLineSpan) }) {
+        val (title, message) = when (reason) {
+            EmptyLibraryReason.Searching -> str("games.search.placeholder") to str("games.search.hint")
+            EmptyLibraryReason.NoFolders -> str("games.empty.noFolders.title") to str("games.empty.noFolders.body")
+            EmptyLibraryReason.Filtered -> str("games.empty.noGames.title") to str("games.empty.filtered.body")
+            EmptyLibraryReason.ScanFailed -> str("games.empty.noGames.title") to str("games.empty.scanFailed.body")
+            EmptyLibraryReason.NoGames -> str("games.empty.noGames.title") to str("games.empty.noGames.body")
+        }
+        val showSetup = reason != EmptyLibraryReason.Searching && reason != EmptyLibraryReason.Filtered
         EmptyState(
-            title = if (noFolders) str("games.empty.noFolders.title") else str("games.search.placeholder"),
-            message = if (noFolders) str("games.empty.noFolders.body") else str("games.search.hint"),
-            actionLabel = if (noFolders) str("games.toolbar.setup") else null,
-            onAction = if (noFolders) MainActivityRuntime::reopenSetup else null,
+            title = title,
+            message = message,
+            actionLabel = if (showSetup) str("games.toolbar.setup") else null,
+            onAction = if (showSetup) MainActivityRuntime::reopenSetup else null,
             modifier = Modifier.fillMaxWidth().height(260.dp),
         )
     }
@@ -2024,6 +2045,18 @@ private fun GameListCard(game: GameInfo, selected: Boolean, onClick: () -> Unit,
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // The file name, so two dumps of one game (a hack, a beta, another revision) read
+                // differently. Left out when it only repeats the title, as for a game named after
+                // its file.
+                game.fileName?.takeIf { !it.substringBeforeLast('.').equals(game.title, ignoreCase = true) }?.let { name ->
+                    Text(
+                        name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 Spacer(Modifier.height(5.dp))
                 GameMetadata(game)
             }
