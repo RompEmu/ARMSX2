@@ -122,10 +122,10 @@ TEST(GSGpuProfileAdreno, SevenHundredSeriesPartsAreAdreno7xx)
 	ExpectTuning(Adreno("Adreno (TM) 702").tuning, 88, 7, 6, false);
 }
 
-// The 722 (Snapdragon 7 Gen 4, Retroid Pocket Duo) sits between the 720 and the 725. Its row copies
-// the 720's sizing, the sibling with the same 1 MiB of GMEM, and that is also what an unlisted 7xx
-// number gets from the fallback. So listing it changes `recognized` and the confidence in the driver
-// report, and nothing about how the part is sized. The numbers beside it stay unlisted.
+// The 722 (Snapdragon 7 Gen 4, Retroid Pocket Duo) copies the 720's sizing, the sibling with the
+// same 1 MiB of GMEM, which is also what an unlisted 7xx number gets from the fallback. Listing it
+// changes `recognized` and the confidence in the driver report, not how the part is sized. The
+// numbers beside it stay unlisted.
 TEST(GSGpuProfileAdreno, TheAdreno722IsListedWithTheAdreno720Sizing)
 {
 	for (const char* name : {"Adreno (TM) 722", "Turnip Adreno (TM) 722"})
@@ -400,7 +400,6 @@ TEST(GSGpuProfileMali, ImmortalisIsNamedAsSuch)
 	EXPECT_EQ(p.gpu.name, "Immortalis-G715 MC11");
 }
 
-// ---------------------------------------------------------------------------------------------
 // Valhall architecture number, as Mesa's panfrost model table counts it (pan_model.c keys each
 // Mali on PAN_PROD_ID(arch, ...); the arch is the first field). Resolved here from GL_RENDERER
 // strings, the way Auto's decision sees them.
@@ -469,9 +468,8 @@ TEST(GSGpuProfileMali, BifrostAndOlderAreNotValhall)
 	}
 }
 
-// The model number is read whole. A reader that stopped at two digits would put G71 and G715 (or
-// G31 and G310, G72 and G720, G51 and G510) in the same place; one that matched G61x loosely would
-// treat G610 and G615 alike.
+// A reader that stopped at two digits would put G71 and G715 (or G31 and G310, G72 and G720, G51
+// and G510) in the same place; one that matched G61x loosely would treat G610 and G615 alike.
 TEST(GSGpuProfileMali, TheWholeModelNumberDecidesTheArchitecture)
 {
 	EXPECT_EQ(ValhallArchOf("Mali-G71 MP8"), 0u);
@@ -489,8 +487,6 @@ TEST(GSGpuProfileMali, TheWholeModelNumberDecidesTheArchitecture)
 	EXPECT_EQ(ValhallArchOf("Mali-G77 MC9"), 9u);
 }
 
-// Only the Valhall architectures carry a number; every other value, including a part nothing
-// resolved, reads as not Valhall.
 TEST(GSGpuProfileMali, OnlyTheValhallArchitecturesHaveAValhallNumber)
 {
 	EXPECT_EQ(GpuProfileDetector::MaliValhallArch(MobileGpuArchitecture::Unknown), 0u);
@@ -613,4 +609,44 @@ TEST(GSGpuProfileDriver, OpenGLVersionsComeFromEachVendorsBuildTag)
 	EXPECT_EQ(powervr.driver.version.major, 1);
 	EXPECT_EQ(powervr.driver.version.minor, 9);
 	EXPECT_EQ(powervr.driver.version.build, 4850625u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// PowerVR
+
+TEST(GSGpuProfilePowerVR, TheCSeriesIsARecognisedFlagship)
+{
+	// Pixel 11 Pro (Tensor G6), Vulkan device name and the ANGLE GL renderer string.
+	for (const char* name : {"PowerVR C-Series CXTP-48-1536 MC1",
+			 "ANGLE (Imagination Technologies, Vulkan 1.4.317 (PowerVR C-Series CXTP-48-1536 MC1 (0x70061042)), "
+			 "PowerVR C-Series Vulkan Driver-1.662.3024)"})
+	{
+		const std::string lowered = GpuProfileDetail::ToLowerASCII(name);
+		ASSERT_TRUE(GpuProfileDetail::LooksLikePowerVR(lowered)) << name;
+		const ResolvedGpuProfile p = GpuProfileDetail::ResolvePowerVRProfile(lowered);
+		EXPECT_EQ(p.gpu.architecture, MobileGpuArchitecture::PowerVR);
+		EXPECT_TRUE(p.gpu.recognized) << name;
+		EXPECT_EQ(p.gpu.name, "PowerVR C-Series") << name;
+		ExpectTuning(p.tuning, 144, 10, 8, true);
+	}
+}
+
+TEST(GSGpuProfilePowerVR, OtherSeriesKeepTheirSizing)
+{
+	const auto Resolve = [](const char* name) {
+		return GpuProfileDetail::ResolvePowerVRProfile(GpuProfileDetail::ToLowerASCII(name));
+	};
+	const ResolvedGpuProfile d = Resolve("PowerVR D-Series DXT-48-1536 MC1");
+	EXPECT_EQ(d.gpu.name, "PowerVR D-Series");
+	ExpectTuning(d.tuning, 112, 8, 7, false);
+	const ResolvedGpuProfile b = Resolve("PowerVR B-Series BXM-8-256");
+	EXPECT_EQ(b.gpu.name, "PowerVR B-Series");
+	ExpectTuning(b.tuning, 112, 8, 7, false);
+	const ResolvedGpuProfile rogue = Resolve("PowerVR Rogue GE8320");
+	EXPECT_FALSE(rogue.gpu.recognized);
+	ExpectTuning(rogue.tuning, 72, 6, 5, false);
+	// The small C-Series parts are not the flagship one.
+	const ResolvedGpuProfile cxm = Resolve("PowerVR C-Series CXM-4-3200 MC1");
+	EXPECT_NE(cxm.gpu.name, "PowerVR C-Series");
+	ExpectTuning(cxm.tuning, 72, 6, 5, false);
 }

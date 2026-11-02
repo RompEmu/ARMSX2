@@ -1553,6 +1553,14 @@ if(ANDROID)
 	if(ARMSX2_USE_OBOE)
 		list(APPEND pcsx2HostSources
 			Host/OboeAudioStream.cpp)
+		# The emulated PS2 mic (SingStar et al.) needs a host audio *input* device. On Android that is
+		# Oboe/AAudio, so the usb-mic stack gets its own oboe-backed AudioDevice next to cubeb's; the
+		# factory in usb-mic.cpp picks it via ARMSX2_USE_OBOE. The header is listed conditionally too,
+		# so desktop IDEs don't see an <oboe/Oboe.h> include they can't resolve.
+		list(APPEND pcsx2USBSources
+			USB/usb-mic/audiodev-oboe.cpp)
+		list(APPEND pcsx2USBHeaders
+			USB/usb-mic/audiodev-oboe.h)
 		target_link_libraries(PCSX2_FLAGS INTERFACE
 			oboe)
 		target_compile_definitions(PCSX2_FLAGS INTERFACE ARMSX2_USE_OBOE)
@@ -2058,11 +2066,13 @@ if (APPLE)
 	# "framework not found".
 	#
 	# ARMSX2_REAL_DEVICE is the iOS app's own switch and nothing sets it for the
-	# libretro core, which is only ever built against a device SDK - and without
-	# the framework the link is short MTLFXSpatialScalerDescriptor, because the
-	# header is there and PCSX2_HAS_METALFX is 1.
+	# libretro core, which is only ever built against a device SDK, or for Mac
+	# Catalyst - and without the framework the link is short
+	# MTLFXSpatialScalerDescriptor, because the header is there and
+	# PCSX2_HAS_METALFX is 1.
 	if(NOT CMAKE_SYSTEM_NAME STREQUAL "tvOS"
-	   AND (ARMSX2_REAL_DEVICE OR ENABLE_LIBRETRO OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"))
+	   AND (ARMSX2_REAL_DEVICE OR ARMSX2_MAC_CATALYST OR ENABLE_LIBRETRO
+	        OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"))
 		target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
 	endif()
 endif()

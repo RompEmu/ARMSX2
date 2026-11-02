@@ -39,18 +39,29 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_alu_tests.cpp
 	ee_rec_alu64_tests.cpp
 	ee_rec_fuzz_tests.cpp
+	ee_rec_const_flush_tests.cpp
+	ee_rec_mult_const_operand_tests.cpp
+	ee_rec_div_const_pow2_tests.cpp
+	ee_rec_div_const_divisor_tests.cpp
+	ee_rec_shift_pair_tests.cpp
+	ee_rec_madd_tests.cpp
 	ee_rec_alu_imm_tests.cpp
 	ee_rec_branch_tests.cpp
 	ee_rec_loop_residency_tests.cpp
+	ee_rec_mem_operand_tests.cpp
 	ee_rec_carbon_selfloop_store_tests.cpp
 	ee_rec_superblock_tests.cpp
 	ee_rec_branch_in_delay_tests.cpp
 	ee_rec_callret_tests.cpp
 	ee_rec_cond_veneer_tests.cpp
 	ee_rec_cop0_tests.cpp
+	ee_event_gate_tests.cpp
 	ee_event_test_quiet_path_tests.cpp
 	mtvu_savestate_load_tests.cpp
 	ee_rec_cycle_rate_tests.cpp
+	ee_rec_delay_slot_bracket_tests.cpp
+	ee_rec_divide_charge_tests.cpp
+	ee_rec_measured_charge_tests.cpp
 	ee_rec_fpu_tests.cpp
 	ee_rec_fpu_divunit_rounding_tests.cpp
 	ee_rec_fpu_full_mode_tests.cpp
@@ -78,6 +89,7 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_timeout_loop_tests.cpp
 	ee_rec_tlb_divert_tests.cpp
 	ee_rec_traps_tests.cpp
+	ee_rec_unaligned_store_tests.cpp
 	ee_timer_count_read_race_tests.cpp
 	vtlb_get_guest_address_tests.cpp
 	vif_unpack_dynarec_tests.cpp
@@ -85,6 +97,7 @@ add_pcsx2_test(recompiler_tests
 	ee_vu0_cop2_madd_clamp_tests.cpp
 	ee_vu0_cop2_sub_mul_clamp_tests.cpp
 	ee_vu0_cop2_madda_bc_tests.cpp
+	ee_vu0_cop2_extra_clamp_tests.cpp
 	vu0_harness_validation_tests.cpp
 	vu0_alu_upper_tests.cpp
 	vu0_alu_lower_tests.cpp

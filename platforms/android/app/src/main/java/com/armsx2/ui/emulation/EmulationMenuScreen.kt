@@ -797,11 +797,11 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
         // hold anything or how old they are, so picking a slot to overwrite after a long
         // session was guesswork -- the Save Manager has had the dates all along, but the quick
         // picker is where the choice actually gets made. Read off disk once per menu open;
-        // SaveSlotLookup is blocking, hence produceState rather than a composition-time call.
-        // ★ getGamePathSlot, NOT SaveSlotLookup.
+        // the read is blocking, hence produceState rather than a composition-time call.
+        // ★ getGamePathSlot, NOT SaveCatalog.
         //
-        // SaveSlotLookup exists for the LIBRARY, where nothing is booted and the only way to
-        // find states is to match `<serial> (title).NN.p2s` on disk. In here a VM is running, so
+        // SaveCatalog exists for the LIBRARY, where nothing is booted and the only way to
+        // find states is to match `<serial> (CRC).NN.p2s` on disk. In here a VM is running, so
         // the native side already knows the exact path for each slot — and it is authoritative
         // where the filename match is a guess that silently returns nothing when the serial is
         // absent or formatted differently, which is what made this show "Empty" for every slot.
@@ -898,8 +898,7 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // GS Multi-threading (GV7 front/back split). Restart-required like the renderer /
     // driver above, so it lives in the same group — hit Apply & Restart below to apply.
     // Off (0) = single-threaded; on (any other value, written as 1) = GS rendering on a
-    // second thread. Description shown inline so users who never open full settings
-    // still understand what it does.
+    // second thread.
     MenuSwitchRow(
         str("renderer.gsBackThread.label"),
         settings.display.gsBackThreadMode != 0,
@@ -1380,8 +1379,35 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
 
 @Composable
 private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
-    MenuSwitchRow(str("pad.onScreenControls.label"), state.touchControlsVisible) {
-        viewModel.toggleTouchControls()
+    // The persisted on-screen controls setting itself, the same value All Settings > Controls
+    // edits, with a button for every choice. This row used to flip a temporary flag that the next
+    // screen touch undid, and after that to step through the choices one tap at a time.
+    val visibilityMode = TouchControls.visibilityMode.intValue
+    val gamepadAttached = TouchControls.gamepadConnected.value
+    SectionCard(str("pad.onScreenControls.label")) {
+        HorizontalOptionRow(
+            options = listOf(
+                TouchControls.VISIBILITY_AUTO to str("backend.renderer.auto"),
+                TouchControls.VISIBILITY_ALWAYS to str("pad.onScreenControls.always"),
+                TouchControls.VISIBILITY_OFF to str("setup.toggle.off"),
+                TouchControls.CHOICE_AUTO_HIDE to str("pad.onScreenControls.autoHide"),
+            ),
+            selected = TouchControls.visibilityChoice(),
+            keyPrefix = "onscreen",
+            onSelect = TouchControls::chooseVisibility,
+        )
+        // Auto and Auto-hide change by themselves, so say what they are doing right now.
+        val status = when {
+            visibilityMode == TouchControls.VISIBILITY_AUTO && gamepadAttached ->
+                str("pad.onScreenControls.nowHidden")
+            visibilityMode == TouchControls.VISIBILITY_AUTO -> str("pad.onScreenControls.nowShown")
+            visibilityMode in 1..10 -> str("pad.onScreenControls.hidesAfter").format(visibilityMode)
+            else -> null
+        }
+        if (status != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
     MenuSwitchRow(
         title = str("pad.rumble.label"),
@@ -1463,7 +1489,6 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // Macros — edit each M1-M4 button set here in-game too (physical-trigger binding stays
     // in All Settings › Controls, which hosts the key-capture listener).
     com.armsx2.ui.settings.MacrosSection()
-    // Arcade controls for the arcade game being played: what each button does on its cabinet.
     com.armsx2.arcade.Arcade.sessionGameId.value?.let { com.armsx2.ui.settings.ArcadeControlsSection(it, pickGame = false) }
 }
 
@@ -1484,8 +1509,8 @@ private fun OptionsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
     // "▣", is one already proven to render in the shipped font -- "▩" (U+25A9) and "⏻" (U+23FB)
     // come out as tofu boxes on device.
     Spacer(Modifier.height(6.dp))
-    // Volume and Mute, the same two settings as All Settings › Audio, kept within reach while
-    // playing rather than three screens deep. Both apply instantly (applyTo's direct setters).
+    // Volume and Mute: the same two settings as All Settings › Audio. Both apply instantly
+    // (applyTo's direct setters).
     com.armsx2.ui.settings.IntSliderRow(
         label = str("audio.volume.label"),
         value = settings.audio.audioVolume.coerceIn(0, 150),

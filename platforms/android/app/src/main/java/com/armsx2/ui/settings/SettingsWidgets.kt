@@ -211,11 +211,10 @@ internal object SettingsControllerNav {
     private val selectedId = mutableStateOf<String?>(null)
 
     /** How many screens laid out in side-by-side columns are up (the texture and patch managers),
-     *  held through [ColumnControllerNav]. While any is, and no modal owns input, Up/Down keep to
-     *  the selection's column and Left/Right reach the next column even where nothing sits level
-     *  with the selection; otherwise a two-column screen walked up and down both columns
-     *  interleaved, and Left/Right did nothing. A count, so two such screens overlapping in a
-     *  transition cannot switch it off for each other. */
+     *  counted through [ColumnControllerNav]. While any is up and no modal owns input, Up/Down stay
+     *  in the selection's column and Left/Right reach the next column even where nothing sits level
+     *  with the selection. A count, so two such screens overlapping in a transition cannot switch
+     *  it off for each other. */
     internal var columnScreens = 0
     val selectedIndex = mutableIntStateOf(-1)
     val scrollVelocity = mutableFloatStateOf(0f)
@@ -285,12 +284,13 @@ internal object SettingsControllerNav {
      *  content it belongs to comes a moment later (the Icon Museum's panel, once its icons have
      *  loaded). The modal opens on [fallback] meanwhile, and [id] takes over when it registers,
      *  as long as the selection is still on [fallback]. */
-    private class LateFocus(val layer: String, val id: String, val fallback: String?)
+    private class LateFocus(val layer: String?, val id: String, val fallback: String?)
     private var lateFocus: LateFocus? = null
 
     /** For PadModal: [id], the focus [layer] asked for on open, is not there yet. Select it when
-     *  it registers, unless the pad has moved by then. */
-    fun focusWhenRegistered(layer: String, id: String) {
+     *  it registers, unless the pad has moved by then. A null [layer] is the base screen's (the
+     *  in-game menu reopening on the control it was left on). */
+    fun focusWhenRegistered(layer: String?, id: String) {
         lateFocus = LateFocus(layer, id, selectedId.value)
     }
 
@@ -298,8 +298,11 @@ internal object SettingsControllerNav {
         registry.remove(id)
         positions.remove(id)
         widths.remove(id)
+        // Handing the selection to the first control scrolls the page there. With the pad driving
+        // that keeps it somewhere reachable; under touch it only flung the page to the top when a
+        // tapped row went away, so the selection is dropped instead.
         if (selectedId.value == id)
-            selectedId.value = orderedIds().firstOrNull()
+            selectedId.value = if (com.armsx2.ui.common.PadInput.active.value) orderedIds().firstOrNull() else null
         selectedIndex.intValue = orderedIds().indexOf(selectedId.value)
     }
 
@@ -571,6 +574,9 @@ internal fun Modifier.controllerFocusable(
     onConfirm: (() -> Unit)? = null,
     onLeft: (() -> Unit)? = null,
     onRight: (() -> Unit)? = null,
+    // False for a stop that should not draw the selection ring, such as the paragraphs of an
+    // opened release on the news board, where the card itself carries it
+    ring: Boolean = true,
 ): Modifier = composed {
     // Which layer this control belongs to is decided by WHERE IT SITS, not by an argument the
     // call site has to remember to pass. That is what lets an unmodified ToggleRow or slider be
@@ -641,7 +647,10 @@ internal fun Modifier.controllerFocusable(
             }
         }
         .then(
-            if (focused || selected) {
+            // Only while the pad drives the UI: Compose focus lands on controls by itself (the
+            // first focusable one when the game surface lets go), and under touch a ring there is
+            // a selection nobody made.
+            if (ring && (focused || selected) && com.armsx2.ui.common.PadInput.active.value) {
                 // Driver-safe selection ring: solid inner + translucent outer border. We
                 // deliberately avoid Modifier.shadow with a custom ambient/spot color here —
                 // Adreno / Mali / Turnip drivers frequently ignore the tint and render the
@@ -772,8 +781,7 @@ fun ToggleRow(
             .padding(vertical = 5.dp)
             .controllerFocusable(
                 controllerId = "toggle:$label",
-                // Only A flips it: Left/Right are for moving, and on a switch they flipped it by
-                // accident on the way past.
+                // Only A flips it, so Left/Right can move focus past the switch without toggling it.
                 onConfirm = { emit(!value) },
             ),
         shape = RoundedCornerShape(22.dp),

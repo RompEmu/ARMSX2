@@ -211,12 +211,11 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
             onAction = { MainActivityRuntime.reopenSetup(); onDismiss() }),
         DrawerItem("setup.step.bios.title", "📀", AppRoute.BiosManager()),
         DrawerItem("memcard.title", "💾", AppRoute.MemoryCardManager()),
-        DrawerItem("savestate.title.loadManage", "📥", AppRoute.SaveManager),
+        DrawerItem("savestate.title.loadManage", "📥", AppRoute.SaveManager()),
         DrawerItem("tab.controls", "🕹️", AppRoute.ControllerManager),
         DrawerItem("patches.dialog.patchesAndCheats", "🪄", AppRoute.PatchManager),
         DrawerItem("renderer.section.texturePacks", "🖌️", AppRoute.TextureManager),
-        // Namco System 246/256 arcade games: their folder, boot files, BIOS and imports. The ARMSX2
-        // logo in PCSX2x6's red.
+        // Namco System 246/256 arcade games: their folder, boot files, BIOS and imports.
         DrawerItem("arcade.title", "👾", AppRoute.Arcade, glyphIcon = com.armsx2.R.drawable.ic_arcade),
     )
     // Link-out rows: they reuse the existing onAction path (like Boot BIOS) rather than a
@@ -369,7 +368,7 @@ private fun sameDestination(current: AppRoute, target: AppRoute): Boolean = when
     is AppRoute.Settings -> current is AppRoute.Settings
     is AppRoute.BiosManager -> current is AppRoute.BiosManager
     is AppRoute.MemoryCardManager -> current is AppRoute.MemoryCardManager
-    AppRoute.SaveManager -> current is AppRoute.SaveManager
+    is AppRoute.SaveManager -> current is AppRoute.SaveManager
     AppRoute.ControllerManager -> current is AppRoute.ControllerManager
     AppRoute.PatchManager -> current is AppRoute.PatchManager
     AppRoute.TextureManager -> current is AppRoute.TextureManager

@@ -112,11 +112,10 @@ fun RendererTab(state: MutableState<Settings>) {
             // one, so the control lives with the driver rather than buried lower in the tab.
             ClearShaderCacheRow()
             SettingsDivider()
-            // GS Multi-threading (the GS front/back thread split), placed right under the
-            // renderer/driver picker. Off (0, the default) = single-threaded GS; on (any
-            // other value; written as 1, older builds wrote 3) = GS rendering on a second
-            // thread. Restart-required (in RestartOptionsAreEqual); native-lib snapshots the
-            // field across a live apply, so it only takes effect on the next game boot.
+            // GS multi-threading (the GS front/back thread split). 0 (the default) = single-threaded
+            // GS; any other value (written as 1) = GS rendering on a second thread. Restart-required
+            // (in RestartOptionsAreEqual): native-lib snapshots the field across a live apply, so it
+            // only takes effect on the next game boot.
             ToggleRow(
                 str("renderer.gsBackThread.label"),
                 s.display.gsBackThreadMode != 0,
@@ -819,7 +818,6 @@ private fun TexturePackImportRow() {
                 )
             }
         }
-        // .zip / .tar.zst import — extracts the archive into the same per-game replacements folder.
         Box(
             Modifier
                 .fillMaxWidth()
@@ -1100,9 +1098,10 @@ private fun ClearShaderCacheRow() {
 }
 
 /** Delete the on-disk compiled shader/pipeline caches: every renderer's files, their debug
- *  variants, the per-game pipeline key lists, the frame-generation SPIR-V and any temporary file a
- *  killed write left behind. They rebuild on the next renderer init. Same set as the core's
- *  GSCacheFile::DeleteAll. Returns how many files were removed. */
+ *  variants, the per-game shader packs (gs_packs/), the pipeline key lists of older builds, the
+ *  frame-generation SPIR-V and any temporary file a killed write left behind. They rebuild on the
+ *  next renderer init. Same set as the core's GSCacheFile::DeleteAll. Returns how many files were
+ *  removed. */
 private fun clearShaderCache(cacheDir: File): Int {
     val prefixes = listOf("vulkan_shaders", "vulkan_pipelines", "gl_programs", "lsfg_spirv")
     var removed = 0
@@ -1110,8 +1109,14 @@ private fun clearShaderCache(cacheDir: File): Int {
         if (f.isFile && prefixes.any { f.name.startsWith(it) } && runCatching { f.delete() }.getOrDefault(false))
             removed++
     }
-    File(cacheDir, "vulkan_pipeline_keys").listFiles()?.forEach { f ->
-        if (runCatching { f.delete() }.getOrDefault(false)) removed++
+    for (dir in listOf("vulkan_pipeline_keys", "gs_packs")) {
+        File(cacheDir, dir).walkBottomUp().forEach { f ->
+            if (f.isFile) {
+                if (runCatching { f.delete() }.getOrDefault(false)) removed++
+            } else {
+                runCatching { f.delete() }
+            }
+        }
     }
     return removed
 }

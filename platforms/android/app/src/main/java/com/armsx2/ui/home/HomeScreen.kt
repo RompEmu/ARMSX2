@@ -280,32 +280,29 @@ fun HomeScreen(
         // (behind the gesture bar) so it never leaves an exposed strip at the bottom —
         // that strip was the "blue bar" in landscape.
         backgroundLayer = {
-            // Nothing of the library shows behind the screensaver, whose scrim is opaque from its
-            // first frame, so the backdrop stops while it is up: every frame the wave, Flurry or a GIF
-            // drew there still had the whole screen composited again, for nobody.
+            // The screensaver's scrim is opaque from its first frame, so the backdrop stops while it
+            // is up: the wave, Flurry or a GIF would otherwise redraw behind it every frame.
             if (!LibraryScreensaver.showing.value) {
                 val libraryBg = LibraryBackground.uri.value
                 if (libraryBg == null) {
-                    // Default: the live PS3-XMB wave (XmbGlView — a GLES3 port of linkev's
-                    // grid-displacement mesh, matching iOS). When GL can't init — older Mali without
-                    // float-texture filtering, or any EGL failure — we fall back to LibraryWaveBackground,
-                    // a procedural PPSSPP-style animated background drawn on the hardware 2D Canvas (no
-                    // GLES3, runs anywhere) that reads the SAME colour prefs as the GL wave, so Mali users
-                    // finally get an animated, recolourable backdrop instead of the old fixed GIF. The
-                    // bundled still is the cheap floor shown during GL startup (and, once the wave is up,
-                    // sits hidden behind it). Custom backgrounds below override all of this.
+                    // Default: the live PS3-XMB wave (XmbGlView, a GLES3 port of linkev's
+                    // grid-displacement mesh, matching iOS). When GL can't init (older Mali without
+                    // float-texture filtering, or any EGL failure), fall back to LibraryWaveBackground,
+                    // a procedural PPSSPP-style animated background on the hardware 2D Canvas (no
+                    // GLES3) that reads the same colour prefs as the GL wave. The bundled still is the
+                    // placeholder shown during GL startup and sits hidden behind the wave once it is up.
+                    // Custom backgrounds below override all of this.
                     if (LibraryBackground.flurry.value) {
-                        // Flurry, in the same shell as the XMB wave: if GL cannot come up we fall back
-                        // to the 2D backdrop rather than leaving a hole, exactly as XmbGlView does.
+                        // Flurry falls back to the 2D backdrop when GL cannot come up, as XmbGlView does.
                         var flurryGl by remember { mutableStateOf<Boolean?>(null) }
                         if (flurryGl == false) {
                             LibraryWaveBackground(Modifier.fillMaxSize())
                         } else {
                             AndroidView(
                                 factory = {
-                                    // currentSpec() resolves which saver AND resolves a "random"
-                                    // preset to a concrete one — read once here, at view creation,
-                                    // so random means once per library open and not once per frame.
+                                    // currentSpec() resolves which saver, and a "random" preset to a
+                                    // concrete one. Read once here at view creation, so random means
+                                    // once per library open, not once per frame.
                                     SaverGlView(it, LibraryBackground.currentSpec()).apply {
                                         onGlStatus = { ok -> flurryGl = ok }
                                     }
@@ -317,8 +314,8 @@ fun HomeScreen(
                             )
                         }
                     } else if (LibraryBackground.animated2D.value) {
-                        // User opted into the lightweight 2D animated wave everywhere (#Luminz) — the same
-                        // backdrop GL-fail devices get; skip the GLES3 XmbGlView entirely.
+                        // The user chose the lightweight 2D animated wave everywhere: the same
+                        // backdrop GL-fail devices get, skipping the GLES3 XmbGlView.
                         LibraryWaveBackground(Modifier.fillMaxSize())
                     } else {
                         var xmbGlState by remember { mutableStateOf<Boolean?>(null) } // null=starting, true=up, false=failed
@@ -347,10 +344,8 @@ fun HomeScreen(
                     )
                 }
                 // Scrim so covers and text stay readable over the backdrop. A user-picked image can
-                // be any brightness, so it gets the full dark scrim. The XMB is our own controlled
-                // backdrop (dark at the top where the content sits) and a heavy scrim just muddied
-                // its blue into navy — so it gets only a whisper of dimming, letting the vivid blue
-                // read through.
+                // be any brightness, so it gets the full dark scrim; the XMB is dark where the content
+                // sits, so it gets only a light one.
                 val scrimTop = if (libraryBg == null) 0.06f else 0.55f
                 val scrimBottom = if (libraryBg == null) 0.20f else 0.80f
                 Box(
@@ -430,6 +425,9 @@ fun HomeScreen(
             // so normal browsing never followed the selector.)
             val allGamesHeaderShown = shownRecents.isNotEmpty() &&
                 state.initialized && state.visibleGames.isNotEmpty()
+            // The cover the pad is on, or none under touch: the index is 0 from the start, so the
+            // first cover wore the highlight whether or not a controller was ever used.
+            val gridSelected = if (com.armsx2.ui.common.PadInput.active.value) state.selectedIndex else -1
             LaunchedEffect(state.selectedIndex, state.visibleGames.size, state.layout, HomeInputController.zone.value) {
                 if (HomeInputController.zone.value != HomeZone.Grid) return@LaunchedEffect
                 // Don't follow (and thus don't scroll away from the top) until the user
@@ -483,7 +481,9 @@ fun HomeScreen(
                         { overflowMenu = true },
                     ),
                 )
-                val tb = HomeInputController.zone.value == HomeZone.Toolbar
+                // Highlights only while the pad drives the library: under touch the zones and the
+                // grid's index still exist (0 from the start), but nobody chose them.
+                val tb = HomeInputController.zone.value == HomeZone.Toolbar && com.armsx2.ui.common.PadInput.active.value
                 val tbi = HomeInputController.toolbarIndex.intValue
                 ArmsTopBar(
                     title = str("games.section.library"),
@@ -625,7 +625,7 @@ fun HomeScreen(
                             onClick = { LibraryKeyboard.open(viewModel.state.value.query, viewModel::setQuery, searchPlaceholder) },
                             placeholder = searchPlaceholder,
                             modifier = Modifier.fillMaxWidth(),
-                            selected = HomeInputController.zone.value == HomeZone.Search,
+                            selected = HomeInputController.zone.value == HomeZone.Search && com.armsx2.ui.common.PadInput.active.value,
                         )
                     }
                 }
@@ -721,7 +721,7 @@ fun HomeScreen(
                 }
 
                 if (shownRecents.isNotEmpty()) {
-                    val recentsSelected = HomeInputController.zone.value == HomeZone.Recents
+                    val recentsSelected = HomeInputController.zone.value == HomeZone.Recents && com.armsx2.ui.common.PadInput.active.value
                     val recentSel = if (recentsSelected) HomeInputController.recentIndex.intValue else -1
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Column {
@@ -939,7 +939,7 @@ fun HomeScreen(
                             // Every row lays out on the same perShelf-slot grid, so a
                             // short last row keeps its covers packed left in sequence.
                             slotsPerRow = perShelf,
-                            selectedIndex = state.selectedIndex,
+                            selectedIndex = gridSelected,
                             startIndex = rowIndex * perShelf,
                             onLaunch = { viewModel.launch(it) },
                             onDetails = { menuGame = it },
@@ -966,7 +966,7 @@ fun HomeScreen(
                         if (state.layout == LibraryLayout.Grid) {
                             GameGridCard(
                                 game = game,
-                                selected = index == state.selectedIndex,
+                                selected = index == gridSelected,
                                 onSelect = { viewModel.setSelection(index) },
                                 onLaunch = { viewModel.launch(game) },
                                 onDetails = { menuGame = game },
@@ -974,7 +974,7 @@ fun HomeScreen(
                         } else {
                             GameListCard(
                                 game = game,
-                                selected = index == state.selectedIndex,
+                                selected = index == gridSelected,
                                 onClick = { viewModel.setSelection(index); viewModel.launch(game) },
                                 onDetails = { menuGame = game },
                             )
@@ -1087,23 +1087,21 @@ fun HomeScreen(
                 }
                 // Save states for this game, straight from the library. Only offered when some
                 // exist — a "Load state" row that opens onto nothing is worse than no row.
-                val slots by androidx.compose.runtime.produceState(initialValue = emptyList<com.armsx2.SaveSlotLookup.Slot>(), game.serial) {
+                val hasSaves by androidx.compose.runtime.produceState(initialValue = false, game.serial) {
                     value = withContext(Dispatchers.IO) {
-                        com.armsx2.SaveSlotLookup.slotsFor(context, game.serial)
+                        com.armsx2.ui.saves.SaveCatalog.hasSaves(context, game.serial)
                     }
                 }
-                if (slots.isNotEmpty())
+                if (hasSaves)
                 {
                     GameMenuAction("💾", str("games.loadState"), "game-menu.loadstate") {
                         menuGame = null
-                        // ★ The real Save Manager, not a bespoke list.
-                        //
-                        // It already renders slots as a grid with preview thumbnails and has its
-                        // own back button — which is both what was asked for and the answer to a
-                        // modal with no touch exit. contextGame exists for exactly this: it is how
-                        // the Save Manager already operates on a game that is not running.
-                        com.armsx2.runtime.MainActivityRuntime.contextGame.value = game
-                        com.armsx2.navigation.UiNavigator.navigate(com.armsx2.navigation.AppRoute.SaveManager)
+                        // The same Save Manager the drawer opens, listing every game's saves,
+                        // scrolled to this one. It reads the save folders and the library, so it
+                        // needs no game in context.
+                        com.armsx2.navigation.UiNavigator.navigate(
+                            com.armsx2.navigation.AppRoute.SaveManager(focusSerial = game.serial),
+                        )
                     }
                 }
                 GameMenuAction("⚙", str("action.settings"), "game-menu.settings") {
@@ -1689,9 +1687,6 @@ private fun LibraryOverflowMenu(
             closeThen { onSort(HomeSort.RecentlyPlayed) }
         }
         OverflowSeparator()
-        // Memory card covers, a section of its own: each game's PS2 save icon, from the player's own
-        // cards, as its cover (Off / Animated / Still, cycling like Cover region), the Icon Museum,
-        // and a note on how it works.
         Text(
             text = str("games.section.memcardCovers"),
             modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
@@ -2245,8 +2240,8 @@ private fun GameCover(
         com.armsx2.runtime.MainActivityRuntime.eState.value == com.armsx2.EmuState.STOPPED &&
         // Nothing to see under the screensaver or the Icon Museum, so no frames drawn for it.
         !LibraryScreensaver.showing.value && !MemcardIconViewerState.open.value
-    // On the GPU a reflection draws the icon itself (the same key, so the same clock: it moves in
-    // step, for next to nothing); the software renderer's reflection reuses the tile's frames.
+    // On the GPU a reflection draws the icon itself (same key, so same clock, moving in step at
+    // negligible cost); the software renderer's reflection reuses the tile's frames.
     val gpu = IconGl.available.value
     val animating = moving && (liveIn == null || gpu)
     var animReady by remember(game.serial, animating) { mutableStateOf(false) }
@@ -2435,6 +2430,9 @@ object HomeInputController {
     fun move(dx: Int, dy: Int): Boolean {
         val viewModel = owner ?: return false
         userNavigated = true
+        // The press that switched from touch to the pad shows where the selection is: nothing was
+        // highlighted until now, so moving it would start from a spot nobody could see.
+        if (com.armsx2.ui.common.PadInput.justActivated) return true
         // Snapshot the highlight so we blip the nav sound only when it actually moves (not when a
         // press runs into an edge).
         val beforeZone = zone.value
@@ -2500,6 +2498,9 @@ object HomeInputController {
 
     fun confirm(): Boolean {
         val viewModel = owner ?: return false
+        // As in move(): a first press only shows the selection, so it cannot launch a game that
+        // was never highlighted.
+        if (com.armsx2.ui.common.PadInput.justActivated) return true
         com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT)
         when (zone.value) {
             HomeZone.Toolbar -> toolbarActions.getOrNull(toolbarIndex.intValue)?.invoke()
@@ -2695,8 +2696,8 @@ private fun ShelfGameCard(game: GameInfo, width: Dp, reflectionHeight: Dp, selec
             // Fade the reflection out toward the front of the shelf.
             Box(Modifier.matchParentSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x55000000)))))
         }
-        // Title under the cover when "Name on grid" is on — shelf covers honour it too now — and
-        // always under Memory Card Covers (see coverNames).
+        // Title under the cover when "Name on grid" is on, and always under Memory Card Covers
+        // (see coverNames).
         if (coverNames()) {
             Text(
                 game.displayTitle(EnglishTitles.enabled.value),

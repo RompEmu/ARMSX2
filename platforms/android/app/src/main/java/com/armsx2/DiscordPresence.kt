@@ -77,6 +77,7 @@ object DiscordPresence {
     private const val PREF_TOKEN = "discord.token"
     private const val PREF_REFRESH = "discord.refresh"
     private const val PREF_NOTIFY = "discord.notifyInGame"
+    private const val PREF_SHOW_GAME = "discord.showGameName"
 
     /** Seconds between RA rich-presence re-checks. Discord rate-limits presence updates, so this
      *  stays well clear of it while still following the game within a few seconds. */
@@ -107,7 +108,6 @@ object DiscordPresence {
     // times, and the poll below waits for the app to come back.
     private val foreground = MutableStateFlow(true)
 
-    /** From the activity's onStart (true) and onStop (false). */
     fun setForeground(fg: Boolean) {
         if (foreground.value == fg) return
         foreground.value = fg
@@ -243,10 +243,10 @@ object DiscordPresence {
     /** Re-publish the current game; used on (re)connect and whenever the running game changes. */
     /**
      * Where in ARMSX2 the player is, when it is neither a game nor the plain library:
-     * [PLACE_MUSEUM], [PLACE_ONLINE_ICONS]. Published the way a game is (as the title, with no
-     * serial and no cover), so a friend's client of any version shows it where it would show a
-     * game's name, and Discord reads it under ARMSX2. The bridge captions the image with the title
-     * when there is no serial, which a friend's client knows not to take for one. Null: the library.
+     * [PLACE_MUSEUM], [PLACE_ONLINE_ICONS]. Published as a game's title with no serial and no
+     * cover, so any client version shows it where a game's name would be. The bridge captions the
+     * image with the title when there is no serial, which a friend's client knows not to take for
+     * one. Null: the library.
      */
     val place = mutableStateOf<String?>(null)
     const val PLACE_MUSEUM = "In the Icon Museum"
@@ -258,7 +258,6 @@ object DiscordPresence {
      *  give the bridge puts "-" in it. Shown, never parsed: see [place]. */
     private const val PLACE_STATE = "\u2800\u2800"
 
-    /** The player is at [where] until [leave]. */
     fun enter(where: String) {
         place.value = where
     }
@@ -302,6 +301,7 @@ object DiscordPresence {
                 putString(DiscordIpc.DATA_COVER, DiscordFriend("", hostGame, party.hostSerial, "").coverUrl.orEmpty())
                 putString(DiscordIpc.DATA_RA, "")
                 putString(DiscordIpc.DATA_PARTY, party.id)
+                putBoolean(DiscordIpc.DATA_SHOW_GAME, showGameName)
             })
             return
         }
@@ -312,6 +312,8 @@ object DiscordPresence {
             putString(DiscordIpc.DATA_COVER, game?.coverUrl.orEmpty())
             putString(DiscordIpc.DATA_RA, if (where != null) PLACE_STATE else lastRaPresence)
             putString(DiscordIpc.DATA_PARTY, party?.id.orEmpty())
+            // A place is published as a title too, but it isn't a game: it keeps "Playing ARMSX2".
+            putBoolean(DiscordIpc.DATA_SHOW_GAME, showGameName && game != null)
         })
     }
 
@@ -369,6 +371,20 @@ object DiscordPresence {
     /** Mirror of [notifyInGame] for Compose, which cannot observe SharedPreferences. */
     val notifyState = mutableStateOf(true)
 
+    /** Name the game in the Discord status ("Playing God of War II") instead of ARMSX2. Default on.
+     *  Idea, the desktop version and this switch by bshar1865 (https://github.com/bshar1865). */
+    var showGameName: Boolean
+        get() = runCatching { MainActivityRuntime.prefs.getBoolean(PREF_SHOW_GAME, true) }.getOrDefault(true)
+        set(value) {
+            runCatching { MainActivityRuntime.prefs.edit().putBoolean(PREF_SHOW_GAME, value).apply() }
+            showGameState.value = value
+            // Republish at once, so the status changes while the switch is still under the finger.
+            pushPresence()
+        }
+
+    /** Mirror of [showGameName] for Compose. */
+    val showGameState = mutableStateOf(true)
+
     // Who we had last poll, so a friend appearing can be told apart from a friend still being here.
     private var knownFriends: Set<String> = emptySet()
 
@@ -406,6 +422,7 @@ object DiscordPresence {
         if (!available() || !enabled || started) return
         started = true
         notifyState.value = notifyInGame
+        showGameState.value = showGameName
         bindHelper()
         // Send it here TOO, not only from onServiceConnected.
         //

@@ -126,8 +126,8 @@ enum : u32
 	VERTEX_BUFFER_MAX_SIZE = 64 * 1024 * 1024,
 
 	// The texture upload ring grows the same way. A title that streams textures every frame
-	// (Baldur's Gate: Dark Alliance uploads ~19 MB a frame in one area) otherwise blocks on the GPU
-	// once a frame when the 32 MiB ring comes round, and CPU and GPU stop overlapping.
+	// otherwise blocks on the GPU once a frame when the 32 MiB ring comes round, and CPU and GPU
+	// stop overlapping.
 	TEXTURE_BUFFER_MAX_SIZE = 128 * 1024 * 1024,
 
 	// The smallest start gsrunner's -vertex-ring-kib may choose.
@@ -188,7 +188,6 @@ static std::mutex s_instance_mutex;
 // empty) list so the existing required-extension scan loops stay valid.
 static constexpr std::array<const char*, 0> s_required_device_extensions = {};
 
-// The instance extensions the last CreateVulkanInstance enabled, for the driver report.
 static std::vector<std::string> s_enabled_instance_extensions;
 
 GSDeviceVK::GSDeviceVK()
@@ -623,12 +622,10 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 
 #ifdef __ANDROID__
 	// Remote play hands its frames to the video encoder as AHardwareBuffers, so they never pass
-	// through the CPU. Both are on practically every Android driver; the foreign queue family is what
-	// lets the encoder's GL take a frame over, so the buffer extension is only asked for alongside it.
-	// Without them, frames are read back instead.
-	//
-	// Both or neither. SupportsExtension enables what it finds, so asking for the two in a row
-	// enabled the foreign queue family alone on a driver that lists it without the buffer one.
+	// through the CPU; without these extensions frames are read back instead. The foreign queue
+	// family is what lets the encoder's GL take a frame over.
+	// Both or neither: SupportsExtension enables what it finds, so asking for the two in a row
+	// would enable the foreign queue family alone on a driver that lists it without the buffer one.
 	const auto listed = [&available_extension_list](const char* name) {
 		return std::any_of(available_extension_list.begin(), available_extension_list.end(),
 			[name](const VkExtensionProperties& properties) { return !std::strcmp(name, properties.extensionName); });
@@ -1159,9 +1156,15 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 
 	// Mali r44p1 loses the device under an in-pass self-read. This alone does not avoid it: the
 	// driver-bug database also puts r44p1 on the render-target copy road.
+	// Imagination's driver: the self-read goes through a subpass input attachment instead of the
+	// feedback-loop layout, so it stays in tile memory (see VulkanDeviceRules).
 	if (m_device_rules.avoid_feedback_loop_layout)
 	{
-		Console.WriteLn("Mali r44p1: disabling attachment-feedback-loop blend path (DEVICE_LOST workaround).");
+		if (IsDevicePowerVR())
+			Console.WriteLn("PowerVR: not using the attachment-feedback-loop layout; the in-pass self-read uses a "
+							"subpass input attachment.");
+		else
+			Console.WriteLn("Mali r44p1: disabling attachment-feedback-loop blend path (DEVICE_LOST workaround).");
 		m_optional_extensions.vk_ext_attachment_feedback_loop_layout = false;
 	}
 
@@ -2394,6 +2397,14 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 	VkAttachmentReference* depth_reference_ptr = nullptr;
 	std::array<VkAttachmentReference, 2> input_reference;
 	u32 num_subpass_inputs = 0;
+	// The framebuffer-local self-dependency is what makes a pipeline barrier inside the pass legal.
+	// The rasterization-order road issues none and needs none. The in-tile read WITHOUT the extension
+	// (PowerVR, VulkanDeviceRules::ordered_input_attachment_read) keeps it anyway. Nothing on that
+	// road is expected to issue an in-pass barrier (offset reads are copied, and the depth feedback
+	// loop stays off without rasterization-order depth access), so this is a no-cost guard that keeps
+	// any barrier that does reach SendHWDraw valid rather than undefined.
+	const bool self_dependency = !m_features.framebuffer_fetch ||
+	                             !m_optional_extensions.vk_ext_rasterization_order_attachment_access;
 	std::array<VkSubpassDependency, 3> subpass_dependency;
 	u32 num_subpass_dependencies = 0;
 	std::array<VkAttachmentDescription, 2> attachments;
@@ -2420,7 +2431,7 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 				num_subpass_inputs++;
 			}
 
-			if (!m_features.framebuffer_fetch)
+			if (self_dependency)
 			{
 				// don't need the framebuffer-local dependency when we have rasterization order attachment access
 				subpass_dependency[num_subpass_dependencies].srcSubpass = 0;
@@ -2465,7 +2476,7 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 				num_subpass_inputs++;
 			}
 
-			if (!m_features.framebuffer_fetch)
+			if (self_dependency)
 			{
 				// don't need the framebuffer-local dependency when we have rasterization order attachment access
 				subpass_dependency[num_subpass_dependencies].srcSubpass = 0;
@@ -3619,11 +3630,10 @@ void GSDeviceVK::EndPresent()
 	else if (GSLsfg::IsActive())
 		GSLsfg::Shutdown();
 
-	// Frame generation on the game's own image instead of the finished screen, when the present
-	// was only the plain scaled blit it can repeat for each generated frame (it draws the ImGui
-	// overlay onto them afresh as well). Here, after Initialize/Shutdown, which may replace the
-	// image copied into, and in this frame's command buffer, where the game texture's layout is
-	// tracked.
+	// Frame generation takes the game's own image instead of the finished screen when the present
+	// was only the plain scaled blit, which it can repeat for each generated frame (the ImGui overlay
+	// is drawn onto those afresh). This runs after Initialize/Shutdown, which may replace the image
+	// copied into, and in this frame's command buffer, where the game texture's layout is tracked.
 	if (GSLsfg::IsActive())
 	{
 		GSTextureVK* const current = static_cast<GSTextureVK*>(GetCurrent());
@@ -4094,6 +4104,11 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 #ifdef __ANDROID__
 	fetch_inputs.any_vendor_trusted = true;
 #endif
+	// PowerVR on Imagination's driver orders a single-sample subpassLoad in tile memory without the
+	// extension (VulkanDeviceRules::ordered_input_attachment_read). Only where the layout extension
+	// is off, so the read is spelled subpassLoad: the ordering says nothing about a sampler read.
+	fetch_inputs.ordered_without_roaa = m_device_rules.ordered_input_attachment_read &&
+	                                    !m_optional_extensions.vk_ext_attachment_feedback_loop_layout;
 	const GSVulkanFramebufferFetchDecision fetch_decision = DecideVulkanFramebufferFetch(fetch_inputs);
 	if (fetch_decision.force_key_ignored)
 	{
@@ -4221,6 +4236,9 @@ void GSDeviceVK::ResolveFeatureTable()
 	// in -- the in-tile read IS the in-pass read, so it cannot outlive the bit that permits one --
 	// and this is here to catch a future edit to that function that forgets it.
 	pxAssert(!m_features.framebuffer_fetch || m_features.texture_barrier);
+	// The in-tile read without the rasterization-order extension is only ordered as subpassLoad.
+	pxAssert(!m_features.framebuffer_fetch || m_optional_extensions.vk_ext_rasterization_order_attachment_access ||
+			 !UseFeedbackLoopLayout());
 
 	// Which spelling of the in-pass self-read this backend uses, published so GSRendererHW can tell
 	// the two apart without knowing about Vulkan extensions. The layout road samples the attachment
@@ -4317,7 +4335,12 @@ void GSDeviceVK::ResolveFeedbackConsumers(const GSSelfReadRoadDecision& road)
 	// renderer adds the per-draw terms.
 	GSFeedbackLoopCarryInputs carry;
 	carry.device_always_carries = IsDeviceBroadcom();
-	carry.device_is_measured_vendor = IsDeviceMali();
+	// PowerVR on its in-tile road (VulkanDeviceRules::ordered_input_attachment_read) is the same
+	// shape as Mali's: a pass declared self-reading by a draw that never reads is the same pass with
+	// one unused input attachment. Without the carry every switch between a destination-reading draw
+	// and a plain one ends the pass: 588 passes for ~1150 draws in NFS Underground at Full blending
+	// on a Pixel 11 Pro, against 151 at Basic, each one a tile store and reload at the upscaled size.
+	carry.device_is_measured_vendor = IsDeviceMali() || m_device_rules.ordered_input_attachment_read;
 	carry.device_is_layout_road_vendor = IsDeviceAdreno();
 	// texture_barrier is what makes SendHWDraw issue the reader's feedback barrier at all. With it
 	// off there is no ordering, so the layout road carries nothing. Consulted only on the layout
@@ -6202,10 +6225,9 @@ bool GSDeviceVK::CreatePipelineLayouts()
 	// the long-standing sampled-image descriptor — subpassLoad still reads the render-pass input
 	// attachment (not vendor-scoped). Keep this condition identical to the writes in ApplyTFXState.
 	// Vendor-scoped per sashkinbro/EmuCoreX 30b09c8 (Fix Adreno Vulkan accurate blending flicker).
+	// PowerVR takes the Mali side: see UseInputAttachmentDescriptors().
 	const VkDescriptorType feedback_descriptor_type =
-		(m_features.texture_barrier && !UseFeedbackLoopLayout() && IsDeviceMali()) ?
-			VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT :
-			VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+		UseInputAttachmentDescriptors() ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
 	dslb.AddBinding(TFX_TEXTURE_RT, feedback_descriptor_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_PRIMID, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_DEPTH, feedback_descriptor_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -6423,8 +6445,10 @@ bool GSDeviceVK::CompileConvertPipelines()
 					// The feedback-loop (fbl) render pass carries the RASTERIZATION_ORDER_ATTACHMENT subpass flag
 					// when framebuffer fetch is available; the pipeline bound in it must declare the matching
 					// color-blend rasterization-order flag or the coherent self-read is undefined. Set (overwrite,
-					// not OR, so fbl=0 stays unflagged).
-					gpb.SetBlendFlags((fbl != 0 && m_features.framebuffer_fetch)
+					// not OR, so fbl=0 stays unflagged). Without the extension (PowerVR's ordered
+					// input-attachment read) neither the subpass nor the pipeline may carry it.
+					gpb.SetBlendFlags((fbl != 0 && m_features.framebuffer_fetch &&
+										  m_optional_extensions.vk_ext_rasterization_order_attachment_access)
 							? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT
 							: 0);
 					arr[ds][fbl] = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
@@ -7800,7 +7824,11 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	// Tests have shown that it's faster to just enable rast order on the entire pass, rather than alternating
 	// between turning it on and off for different draws, and adding the required barrier between non-rast-order
 	// and rast-order draws.
-	if (m_features.framebuffer_fetch && p.IsRTFeedbackLoop())
+	// The flag exists only with the extension. PowerVR's in-tile read without it
+	// (VulkanDeviceRules::ordered_input_attachment_read) is ordered by the hardware, not by a flag,
+	// and the render pass declares no rasterization-order subpass flag for it either.
+	if (m_features.framebuffer_fetch && p.IsRTFeedbackLoop() &&
+		m_optional_extensions.vk_ext_rasterization_order_attachment_access)
 		gpb.AddBlendFlags(VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT);
 	// The declared-loop road on a driver that orders overlapping primitives only on request: only
 	// the draws the renderer marked get it, because the per-overlap wait is what costs.
@@ -7858,54 +7886,27 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 	const double tfx_compile_ms =
 		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - tfx_compile_start);
 	if (tfx_compile_ms >= 20.0)
-	{
-		Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline (n=%u since last cache flush)",
-			tfx_compile_ms, m_tfx_pipeline_compile_counter + 1);
-	}
+		Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline", tfx_compile_ms);
 	m_tfx_pipelines.emplace(p, pipeline);
 	if (pipeline != VK_NULL_HANDLE)
 		RecordTFXPipelineKey(p);
 
-	// Persist the pipeline cache every N new compiles so an Android OOM-kill
-	// or crash mid-session doesn't throw away pipelines that compiled after
-	// the last onPause flush. Android gets a larger threshold because the log
-	// showed repeated synchronous disk writes during normal gameplay in heavy
-	// scenes; onPause still performs a final flush.
-#ifdef __ANDROID__
-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 256;
-#else
-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 32;
-#endif
-	if (g_vulkan_shader_cache && ++m_tfx_pipeline_compile_counter >= PIPELINE_CACHE_FLUSH_THRESHOLD)
-	{
-		m_tfx_pipeline_compile_counter = 0;
-		g_vulkan_shader_cache->FlushPipelineCache();
-	}
+	// The pipeline cache reaches the disk from the shader cache's background writer, about once a
+	// minute while it changes: never from here.
 	return pipeline;
 }
 
 namespace
 {
-#pragma pack(push, 4)
-	struct TFXKeyFileRecord
-	{
-		GSDeviceVK::PipelineSelector key;
-		/// The last session that drew with this key.
-		u32 last_session;
-		/// GSCacheFile::SealRecord's checksum of the fields above.
-		u32 checksum;
-	};
-#pragma pack(pop)
-	static constexpr u32 TFX_KEY_RECORD_SIZE = sizeof(TFXKeyFileRecord);
+	/// The key list's entries: a pipeline key with the last session that drew with it (a u32), and
+	/// the number of the latest session (under an empty key).
+	static constexpr u16 KEY_TYPE_PIPELINE = 1;
+	static constexpr u16 KEY_TYPE_SESSION = 2;
 
 	/// Keys drawn with in this many of the game's most recent sessions are built ahead of use; older
-	/// ones stay in the file but cost no memory. A key not drawn with in KEEP_SESSIONS is dropped.
+	/// ones stay in the list but cost no memory. A key not drawn with in KEEP_SESSIONS is dropped.
 	static constexpr u32 PRECOMPILE_SESSIONS = 4;
 	static constexpr u32 KEEP_SESSIONS = 32;
-
-	/// Key files kept in the directory, one per game and device configuration; the least recently
-	/// played go first.
-	static constexpr size_t MAX_TFX_KEY_FILES = 128;
 
 	/// Pipelines built ahead of use, in the order the game first used them.
 	static size_t GetMaxPrecompiledTFXPipelines()
@@ -7914,7 +7915,7 @@ namespace
 		return (GetPhysicalMemory() >= 6 * GB) ? 2048 : 768;
 	}
 
-	/// Keys come from a file this build wrote (the stamp holds the build identity) and each record
+	/// Keys come from a list this build wrote (the stamp holds the build identity) and each record
 	/// passed its checksum, so these always hold. They are checked anyway, since a bad key would be
 	/// compiled on a worker thread: every field that indexes a table or names an enum, and every bit
 	/// a real key leaves zero.
@@ -7935,64 +7936,6 @@ namespace
 			   p.cms._free == 0 && p.ps.atst <= GSShader::PS_ATST::NOTEQUAL && p.ps.afail <= GSShader::PS_AFAIL::RGB_ONLY_SW_Z &&
 			   p.ps.rov_depth <= GSShader::PS_ROV_DEPTH::READ_ONLY &&
 			   p.ps.blend_hw <= static_cast<u32>(HWBlendType::INV_SRC_DST_BLEND_HALF);
-	}
-
-	/// Builds whose lists are kept: two builds sharing a data root (stable and nightly) each keep
-	/// theirs, and the lists of builds no longer run are removed.
-	static constexpr size_t KEEP_BUILDS = 3;
-
-	/// The build token of a key file name, `<serial>_<crc>_<config>_<build>[_debug].bin`.
-	static std::string_view TFXKeyFileBuild(std::string_view name)
-	{
-		name = name.substr(0, name.rfind('.'));
-		if (name.size() > 6 && name.substr(name.size() - 6) == "_debug")
-			name = name.substr(0, name.size() - 6);
-		const size_t pos = name.rfind('_');
-		return (pos == std::string_view::npos) ? std::string_view() : name.substr(pos + 1);
-	}
-
-	static void PruneTFXKeyFiles(const std::string& dir, std::string_view current_build)
-	{
-		FileSystem::FindResultsArray files;
-		if (!FileSystem::FindFiles(dir.c_str(), "*.bin", FILESYSTEM_FIND_FILES, &files))
-			return;
-
-		// Newest use of each build's lists; the current build always stays.
-		std::vector<std::pair<std::string, s64>> builds;
-		for (const FILESYSTEM_FIND_DATA& fd : files)
-		{
-			const std::string build(TFXKeyFileBuild(Path::GetFileName(fd.FileName)));
-			auto it = std::find_if(builds.begin(), builds.end(), [&build](const auto& b) { return b.first == build; });
-			if (it == builds.end())
-				builds.emplace_back(build, static_cast<s64>(fd.ModificationTime));
-			else
-				it->second = std::max(it->second, static_cast<s64>(fd.ModificationTime));
-		}
-		std::sort(builds.begin(), builds.end(), [&current_build](const auto& a, const auto& b) {
-			if ((a.first == current_build) != (b.first == current_build))
-				return a.first == current_build;
-			return a.second > b.second;
-		});
-		if (builds.size() > KEEP_BUILDS)
-			builds.resize(KEEP_BUILDS);
-
-		std::vector<FILESYSTEM_FIND_DATA> kept;
-		for (FILESYSTEM_FIND_DATA& fd : files)
-		{
-			const std::string_view build = TFXKeyFileBuild(Path::GetFileName(fd.FileName));
-			if (std::none_of(builds.begin(), builds.end(), [&build](const auto& b) { return b.first == build; }))
-				FileSystem::DeleteFilePath(fd.FileName.c_str());
-			else
-				kept.push_back(std::move(fd));
-		}
-
-		if (kept.size() <= MAX_TFX_KEY_FILES)
-			return;
-		std::sort(kept.begin(), kept.end(), [](const FILESYSTEM_FIND_DATA& a, const FILESYSTEM_FIND_DATA& b) {
-			return a.ModificationTime < b.ModificationTime;
-		});
-		for (size_t i = 0; i < kept.size() - MAX_TFX_KEY_FILES; i++)
-			FileSystem::DeleteFilePath(kept[i].FileName.c_str());
 	}
 } // namespace
 
@@ -8023,11 +7966,10 @@ void GSDeviceVK::SetGameIdentity(const std::string& serial, u32 crc)
 {
 	StopPipelinePrecompile();
 
-	if (!GSConfig.PrecompilePipelines || GSConfig.DisableShaderCache || serial.empty())
+	if (!g_vulkan_shader_cache)
 		return;
-
-	const std::string dir = Path::Combine(EmuFolders::Cache, "vulkan_pipeline_keys");
-	if (!FileSystem::EnsureDirectoryExists(dir.c_str(), false))
+	g_vulkan_shader_cache->SetGame(serial, crc);
+	if (!GSConfig.PrecompilePipelines || GSConfig.DisableShaderCache || serial.empty())
 		return;
 
 	// The build identity is in the stamp because what a key means is defined by this build's code:
@@ -8036,82 +7978,51 @@ void GSDeviceVK::SetGameIdentity(const std::string& serial, u32 crc)
 	// family or of a covered setting keeps both lists; the driver version is not, so a driver update
 	// keeps the list, which is the point of it.
 	const std::string fingerprint = GetTFXPipelineKeyFingerprint();
-	const GSCacheFile::Digest fingerprint_digest = GSCacheFile::Hash128(fingerprint.data(), fingerprint.size());
-	GSCacheFile::Stamp stamp;
-	stamp.Add("build", GSCacheFile::GetBuildId());
-	stamp.Add("device", fingerprint);
-
 	const std::string& build_id = GSCacheFile::GetBuildId();
-	const std::string build_token = GSCacheFile::ShortName(GSCacheFile::Hash128(build_id.data(), build_id.size()));
-	const std::string path = Path::Combine(dir,
-		Path::SanitizeFileName(fmt::format("{}_{:08X}_{:02x}{:02x}{:02x}{:02x}_{}{}.bin", serial, crc,
-			fingerprint_digest.bytes[0], fingerprint_digest.bytes[1], fingerprint_digest.bytes[2],
-			fingerprint_digest.bytes[3], build_token, GSConfig.UseDebugDevice ? "_debug" : "")));
-	GSCacheFile::CleanStaleTempFiles(dir);
+	GSCacheFile::Stamp stamp;
+	stamp.Add("build", build_id);
+	stamp.Add("device", fingerprint);
+	const std::string stem = fmt::format("vk_keys{}_{}_{}", GSConfig.UseDebugDevice ? "_debug" : "",
+		GSCacheFile::ShortName(GSCacheFile::Hash128(fingerprint.data(), fingerprint.size())),
+		GSCacheFile::ShortName(GSCacheFile::Hash128(build_id.data(), build_id.size())));
+	m_tfx_key_pack = g_vulkan_shader_cache->OpenGamePack(serial, crc, "vk_keys", stem, GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp);
+	if (!m_tfx_key_pack)
+		return;
 
-	// Read what the last sessions recorded, drop what has gone stale, and write it back with this
-	// session's number. A record that fails its checksum, or a torn one at the end, is dropped here.
-	std::vector<TFXKeyFileRecord> records;
 	u32 session = 1;
-	if (std::optional<std::vector<u8>> data = FileSystem::ReadBinaryFile(path.c_str()); data.has_value())
+	if (std::vector<u8> value; m_tfx_key_pack->Get(KEY_TYPE_SESSION, nullptr, 0, &value) && value.size() == sizeof(u32))
 	{
-		u64 last_session = 0;
-		u32 dropped = 0;
-		std::vector<std::vector<u8>> raw;
-		const GSCacheFile::ReadResult res = GSCacheFile::ParseRecordFile(
-			*data, GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp, TFX_KEY_RECORD_SIZE, &last_session, &raw, &dropped);
-		if (res != GSCacheFile::ReadResult::Ok)
-		{
-			INFO_LOG("Vulkan: discarding the pipeline key list '{}': {}", Path::GetFileName(path),
-				GSCacheFile::ReadResultString(res));
-		}
-		else
-		{
-			if (dropped > 0)
-				WARNING_LOG("Vulkan: {} damaged records in the pipeline key list '{}'", dropped, Path::GetFileName(path));
-			session = static_cast<u32>(last_session) + 1;
-			records.reserve(raw.size());
-			for (const std::vector<u8>& bytes : raw)
-			{
-				TFXKeyFileRecord rec;
-				std::memcpy(&rec, bytes.data(), sizeof(rec));
-				if (rec.last_session >= session || session - rec.last_session > KEEP_SESSIONS ||
-					!IsLoadableTFXKey(rec.key) || m_recorded_tfx_keys.find(rec.key) != m_recorded_tfx_keys.end())
-				{
-					continue;
-				}
-				m_recorded_tfx_keys.emplace(rec.key, RecordedTFXKey{static_cast<u32>(records.size()), rec.last_session});
-				records.push_back(rec);
-			}
-		}
+		std::memcpy(&session, value.data(), sizeof(session));
+		session++;
 	}
 	m_tfx_key_session = session;
+	m_tfx_key_pack->Put(KEY_TYPE_SESSION, nullptr, 0, &session, sizeof(session));
 
+	// What the last sessions recorded, in the order the game first drew with them. What has gone
+	// stale is dropped from the list.
+	struct RecordedKey
 	{
-		std::vector<u8> out = GSCacheFile::MakeRecordFileHeader(
-			GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp, TFX_KEY_RECORD_SIZE, session);
-		const size_t header_size = out.size();
-		out.resize(header_size + records.size() * sizeof(TFXKeyFileRecord));
-		if (!records.empty())
-			std::memcpy(out.data() + header_size, records.data(), records.size() * sizeof(TFXKeyFileRecord));
-		if (!GSCacheFile::WriteFileAtomic(path, out.data(), out.size()))
-		{
-			m_recorded_tfx_keys.clear();
-			ERROR_LOG("Vulkan: could not write the pipeline key file '{}'", path);
+		PipelineSelector key;
+		u32 last_session;
+	};
+	std::vector<RecordedKey> records;
+	std::vector<PipelineSelector> stale;
+	m_tfx_key_pack->ForEach(KEY_TYPE_PIPELINE, [&](const u8* key, u32 key_size, const std::vector<u8>& value, u32) {
+		if (key_size != sizeof(PipelineSelector) || value.size() != sizeof(u32))
 			return;
-		}
-	}
-	m_tfx_key_file = FileSystem::OpenCFile(path.c_str(), "r+b");
-	if (!m_tfx_key_file)
-	{
-		m_recorded_tfx_keys.clear();
-		ERROR_LOG("Vulkan: could not open the pipeline key file '{}'", path);
-		return;
-	}
-	PruneTFXKeyFiles(dir, build_token);
+		RecordedKey rec;
+		std::memcpy(&rec.key, key, sizeof(rec.key));
+		std::memcpy(&rec.last_session, value.data(), sizeof(rec.last_session));
+		if (rec.last_session >= session || session - rec.last_session > KEEP_SESSIONS || !IsLoadableTFXKey(rec.key))
+			stale.push_back(rec.key);
+		else
+			records.push_back(rec);
+	});
+	for (const PipelineSelector& key : stale)
+		m_tfx_key_pack->Erase(KEY_TYPE_PIPELINE, &key, sizeof(key));
 
 	const size_t max_jobs = GetMaxPrecompiledTFXPipelines();
-	for (const TFXKeyFileRecord& rec : records)
+	for (const RecordedKey& rec : records)
 	{
 		if (m_precompile_jobs.size() >= max_jobs)
 			break;
@@ -8247,47 +8158,19 @@ void GSDeviceVK::StopPipelinePrecompile()
 	m_precompile_jobs.clear();
 	m_precompile_active = false;
 
-	m_recorded_tfx_keys.clear();
-	if (m_tfx_key_file)
-	{
-		std::fclose(m_tfx_key_file);
-		m_tfx_key_file = nullptr;
-	}
+	// Written once more by the cache's writer, then let go.
+	if (m_tfx_key_pack && g_vulkan_shader_cache)
+		g_vulkan_shader_cache->ReleasePack(std::move(m_tfx_key_pack));
+	m_tfx_key_pack.reset();
 }
 
 void GSDeviceVK::RecordTFXPipelineKey(const PipelineSelector& p)
 {
-	if (!m_tfx_key_file)
-		return;
-
-	// A key already in the file gets this session's number; a new one is appended.
-	const auto it = m_recorded_tfx_keys.find(p);
-	if (it != m_recorded_tfx_keys.end() && it->second.last_session == m_tfx_key_session)
-		return;
-
-	const u32 index = (it != m_recorded_tfx_keys.end()) ? it->second.index : static_cast<u32>(m_recorded_tfx_keys.size());
-	// Copied byte for byte into a zeroed record. A member-wise copy leaves the selector's tail padding
-	// undefined, the maps compare selectors with memcmp, and a key read back with stray padding would
-	// never match a draw: its precompiled pipeline would go unused and the key be recorded again.
-	TFXKeyFileRecord rec;
-	std::memset(&rec, 0, sizeof(rec));
-	std::memcpy(&rec.key, &p, sizeof(p));
-	rec.last_session = m_tfx_key_session;
-	GSCacheFile::SealRecord(&rec, TFX_KEY_RECORD_SIZE);
-	if (FileSystem::FSeek64(m_tfx_key_file,
-			static_cast<s64>(GSCacheFile::GetRecordFileHeaderSize()) + static_cast<s64>(index) * sizeof(rec), SEEK_SET) != 0 ||
-		std::fwrite(&rec, sizeof(rec), 1, m_tfx_key_file) != 1 || std::fflush(m_tfx_key_file) != 0)
-	{
-		Console.Error("Vulkan: failed to write to the pipeline key file, recording stopped");
-		std::fclose(m_tfx_key_file);
-		m_tfx_key_file = nullptr;
-		return;
-	}
-
-	if (it != m_recorded_tfx_keys.end())
-		it->second.last_session = m_tfx_key_session;
-	else
-		m_recorded_tfx_keys.emplace(p, RecordedTFXKey{index, m_tfx_key_session});
+	// RAM only; the pack leaves an entry that already holds this session alone. The key is stored
+	// byte for byte, padding included: the maps compare selectors with memcmp, and a key read back
+	// with other padding would never match a draw.
+	if (m_tfx_key_pack)
+		m_tfx_key_pack->Put(KEY_TYPE_PIPELINE, &p, sizeof(p), &m_tfx_key_session, sizeof(m_tfx_key_session));
 }
 
 bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)
@@ -9036,7 +8919,7 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_RT)
 		{
-			if (m_features.texture_barrier && !UseFeedbackLoopLayout() && IsDeviceMali())
+			if (UseInputAttachmentDescriptors())
 			{
 				dsub.AddInputAttachmentDescriptorWrite(
 					ds, TFX_TEXTURE_RT, m_tfx_textures[TFX_TEXTURE_RT]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
@@ -9054,7 +8937,7 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH)
 		{
-			if (m_features.texture_barrier && !UseFeedbackLoopLayout() && IsDeviceMali())
+			if (UseInputAttachmentDescriptors())
 			{
 				dsub.AddInputAttachmentDescriptorWrite(
 					ds, TFX_TEXTURE_DEPTH, m_tfx_textures[TFX_TEXTURE_DEPTH]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
@@ -9510,11 +9393,10 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 				// Built over the whole target, since the draws that share it can land anywhere.
 				m_date_copy.valid = false;
 				SetupDATE(draw_rt, config.ds, config.datm, GSVector4i::loadh(rtsize));
-				// The pass this opens holds the run that used to read the target, and a pass holding a
-				// declared feedback loop is never tiled on Turnip. Without a read left in it the
-				// driver's autotuner may tile it, and Indiana Jones' corpus scene then took 9.6 ms at
-				// 2x where it takes 7.0 untiled (Nova, axfl2-001). Declaring the loop on this one draw
-				// keeps the pass untiled, as it was, for one wait per run.
+				// The pass this opens holds the run that used to read the target, and Turnip never tiles
+				// a pass holding a declared feedback loop. Without a read left in it the driver's
+				// autotuner may tile it, which is slower here. Declaring the loop on this one draw keeps
+				// the pass untiled, for one wait per run.
 				if (draw_rt && UseFeedbackLoopLayout())
 				{
 					pipe.feedback_loop_flags |= FeedbackLoopFlag_ReadAndWriteRT;
@@ -10242,9 +10124,7 @@ void GSDeviceVK::CollectDriverReport(GSDriverReport::BackendReport& out) const
 
 #ifdef __ANDROID__
 
-// ---- Remote play ---------------------------------------------------------------------------------
-//
-// The stream's frames (GS/GSRemotePlay.h). Every presented frame is drawn at the stream's size and
+// Remote play's frames (GS/GSRemotePlay.h). Every presented frame is drawn at the stream's size and
 // copied into a free slot, recorded into the frame's own command buffer ahead of the present, which
 // submits it with everything else. The app's video thread picks it up once the GPU marks it done.
 
