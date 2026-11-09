@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <deque>
 #include <thread>
 #include <mutex>
@@ -51,6 +52,29 @@ static constexpr std::array<PresentShader, 8> s_tv_shader_indices = {
 
 static std::deque<std::thread> s_screenshot_threads;
 static std::mutex s_screenshot_threads_mutex;
+
+// Where the last GS dump request is, for GSGetDumpStatus(). The GS thread writes these (QueueSnapshot
+// and VSync both run on it) and any thread reads. The counts are stored before the phase that makes
+// them meaningful, with release, so a reader that sees the phase sees its counts.
+static std::atomic<u32> s_dump_phase{static_cast<u32>(GSDumpPhase::Idle)};
+static std::atomic<u32> s_dump_vsyncs_to_open{0};
+static std::atomic<u32> s_dump_vsyncs_to_recorded{0};
+// GS thread only: vsyncs seen, and the count when the current dump request was accepted.
+static u32 s_vsync_count = 0;
+static u32 s_dump_request_vsync = 0;
+
+static void SetDumpPhase(GSDumpPhase phase)
+{
+	s_dump_phase.store(static_cast<u32>(phase), std::memory_order_release);
+}
+
+GSDumpStatus GSGetDumpStatus()
+{
+	// The phase first: the counts it vouches for were stored before it was.
+	const GSDumpPhase phase = static_cast<GSDumpPhase>(s_dump_phase.load(std::memory_order_acquire));
+	return GSDumpStatus{phase, s_dump_vsyncs_to_open.load(std::memory_order_relaxed),
+		s_dump_vsyncs_to_recorded.load(std::memory_order_relaxed)};
+}
 
 std::unique_ptr<GSRenderer> g_gs_renderer;
 
@@ -77,6 +101,12 @@ static int s_portrait_render_top_inset = 0;
 // awkwardly low and the letterbox lands where the hinge/controller is — reported as the one thing
 // keeping those users on another emulator. Default off (centre), so nothing changes unless asked.
 static bool s_landscape_render_top = false;
+// Side-by-side VR (GSSetSideBySideVR): the frame drawn once in each half of the window, for phone
+// headsets. Off unless a frontend turns it on.
+static bool s_sbs_vr = false;
+static int s_sbs_vr_size = 80;
+static int s_sbs_vr_distance = 0;
+static int s_sbs_vr_height = 0;
 
 // Defined further down alongside the present path. Forward-declared because Merge() needs the
 // frame's on-screen rect to size the RetroArch shader chain, and it runs before them.
@@ -106,6 +136,9 @@ void GSRenderer::Reset(bool hardware_reset)
 
 void GSRenderer::Destroy()
 {
+	// A request that was still waiting or recording will not be served; a poller must not wait on it.
+	SetDumpPhase(GSDumpPhase::Idle);
+
 	// The probe target and its readback buffer belong to the device, which is torn down right
 	// after this. Hand them back while it still exists.
 	m_field_shift.Reset();
@@ -723,6 +756,56 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	return ret;
 }
 
+/// The two eye rects of side-by-side VR. Each half of the window holds a box s_sbs_vr_size percent
+/// of the half, moved within the room left over by the distance and height settings; the frame is
+/// fitted into each box at its aspect ratio and centred there. The display alignment and render-top
+/// options do not apply: a headset's lenses are centred on its halves.
+static void CalculateSideBySideRects(s32 window_width, s32 window_height, const GSVector4i& src_rect,
+	const GSVector2i& src_size, bool flip_y, bool is_progressive, GSVector4* left, GSVector4* right)
+{
+	const float half_w = static_cast<float>(window_width) * 0.5f;
+	const float full_h = static_cast<float>(window_height);
+	const float scale = static_cast<float>(std::clamp(s_sbs_vr_size, 30, 100)) / 100.0f;
+	const float box_w = std::max(half_w * scale, 1.0f);
+	const float box_h = std::max(full_h * scale, 1.0f);
+	const float room_x = (half_w - box_w) * 0.5f;
+	const float room_y = (full_h - box_h) * 0.5f;
+	const float apart = room_x * static_cast<float>(std::clamp(s_sbs_vr_distance, -100, 100)) / 100.0f;
+	const float box_y = room_y + room_y * static_cast<float>(std::clamp(s_sbs_vr_height, -100, 100)) / 100.0f;
+	const float left_box_x = room_x - apart;
+	const float right_box_x = half_w + room_x + apart;
+
+	const GSVector4 fit = CalculateDrawDstRect(static_cast<s32>(box_w), static_cast<s32>(box_h), src_rect, src_size,
+		GSDisplayAlignment::Center, false, is_progressive);
+	const float fit_w = fit.z - fit.x;
+	const float fit_h = fit.w - fit.y;
+	const float in_x = (box_w - fit_w) * 0.5f;
+	float top = box_y + (box_h - fit_h) * 0.5f;
+	if (flip_y)
+		top = full_h - (top + fit_h);
+	*left = GSVector4(left_box_x + in_x, top, left_box_x + in_x + fit_w, top + fit_h);
+	*right = GSVector4(right_box_x + in_x, top, right_box_x + in_x + fit_w, top + fit_h);
+}
+
+/// Draws [current] at [draw_rect], or at both eye rects while side-by-side VR is on.
+static void PresentFrameRects(GSTexture* current, const GSVector4i& src_rect, const GSVector4& src_uv,
+	const GSVector4& draw_rect, bool is_progressive, float shader_time)
+{
+	const PresentShader shader = s_tv_shader_indices[GSConfig.TVShader];
+	const Filter filter = BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off);
+	if (!s_sbs_vr)
+	{
+		g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect, shader, shader_time, filter);
+		return;
+	}
+	const GSVector2i pres_size = g_gs_device->GetPresentationSize();
+	GSVector4 left, right;
+	CalculateSideBySideRects(pres_size.x, pres_size.y, src_rect, current->GetSize(), g_gs_device->UsesLowerLeftOrigin(),
+		is_progressive, &left, &right);
+	g_gs_device->PresentRect(current, src_uv, nullptr, left, shader, shader_time, filter);
+	g_gs_device->PresentRect(current, src_uv, nullptr, right, shader, shader_time, filter);
+}
+
 static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i real_size)
 {
 	const GSVector2i size(src->GetSize());
@@ -979,6 +1062,8 @@ static GSVector4 RemotePlayArea(const GSVector4& draw_rect)
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	s_vsync_count++;
+
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		if (GSConfig.SaveInfo)
@@ -1328,8 +1413,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				const u64 current_time = Common::Timer::GetCurrentValue();
 				const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
 
-				g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
-					s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+				PresentFrameRects(current, src_rect, src_uv, draw_rect, GetVideoMode() == GSVideoMode::SDTV_480P, shader_time);
 				// This condition IS "the GS produced a frame this vsync" — every other present
 				// path either has no output to draw or redraws the previous one. Frame generation
 				// reads it so it does not interpolate motion into frames the game never drew.
@@ -1339,7 +1423,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				// filters it, rotation turns it.
 				g_gs_device->NotePresentGeometry(src_rect, draw_rect, GSConfig.LinearPresent != GSPostBilinearMode::Off,
 					GSConfig.Upscaler == GSUpscaler::Off && GSConfig.CASMode == GSCASMode::Disabled &&
-						s_tv_shader_indices[GSConfig.TVShader] == PresentShader::COPY &&
+						s_tv_shader_indices[GSConfig.TVShader] == PresentShader::COPY && !s_sbs_vr &&
 						GSConfig.LinearPresent != GSPostBilinearMode::BilinearSharp &&
 						g_gs_device->GetPresentRotation() == DisplayRotation::Rot0 && !g_gs_device->UsesLowerLeftOrigin());
 			}
@@ -1451,6 +1535,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 					(m_dump_frames == 1) ? TRANSLATE_SV("GS", "single frame") : TRANSLATE_SV("GS", "multi-frame"), compression_str,
 					Path::GetFileName(m_dump->GetFinalPath())),
 				Host::OSD_INFO_DURATION);
+
+			s_dump_vsyncs_to_open.store(s_vsync_count - s_dump_request_vsync, std::memory_order_relaxed);
+			SetDumpPhase(GSDumpPhase::Recording);
 		}
 
 		const bool internal_resolution = (GSConfig.ScreenshotSize >= GSScreenshotSize::InternalResolution);
@@ -1481,11 +1568,21 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	{
 		if (m_dump->VSync(field, snapshot_action.dump_is_last, m_regs))
 		{
+			// Every frame is in the dump. What follows (writing the screenshot, finishing the
+			// compressed stream, building the zip) takes seconds on a handheld and needs no running
+			// game, so a poller that wants the game to stop at the recorded frame must not wait for
+			// the zip.
+			s_dump_vsyncs_to_recorded.store(s_vsync_count - s_dump_request_vsync, std::memory_order_relaxed);
+			SetDumpPhase(GSDumpPhase::Packing);
+			Console.WriteLn("GSDump: recorded; opened %u vsync(s) and finished %u vsync(s) after the request.",
+				s_dump_vsyncs_to_open.load(std::memory_order_relaxed), s_dump_vsyncs_to_recorded.load(std::memory_order_relaxed));
+
 			Host::AddKeyedOSDMessage("GSDump",
 				fmt::format(TRANSLATE_FS("GS", "Saved GS dump to '{}'."), Path::GetFileName(m_dump->GetFinalPath())),
 				Host::OSD_INFO_DURATION);
 			// Closes the dump and packs the zip. A failed pack replaces the message above.
 			m_dump.reset();
+			SetDumpPhase(GSDumpPhase::Done);
 		}
 		else if (!snapshot_action.dump_is_last)
 		{
@@ -1510,6 +1607,16 @@ bool GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 
 	// this is really gross, but wx we get the snapshot request after shift...
 	m_snapshot_dump_frames = gsdump_frames;
+
+	// A dump request starts a new status. One that lands on a recording already running is refused
+	// at the VSync that serves it and must not reset what that recording reports.
+	if (gsdump_frames > 0 && !m_dump)
+	{
+		s_dump_vsyncs_to_open.store(0, std::memory_order_relaxed);
+		s_dump_vsyncs_to_recorded.store(0, std::memory_order_relaxed);
+		s_dump_request_vsync = s_vsync_count;
+		SetDumpPhase(GSDumpPhase::Queued);
+	}
 	return true;
 }
 
@@ -1605,8 +1712,7 @@ void GSRenderer::PresentCurrentFrame()
 			const u64 current_time = Common::Timer::GetCurrentValue();
 			const float shader_time = static_cast<float>(Common::Timer::ConvertValueToSeconds(current_time - m_shader_time_start));
 
-			g_gs_device->PresentRect(current, src_uv, nullptr, draw_rect,
-				s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
+			PresentFrameRects(current, src_rect, src_uv, draw_rect, GetVideoMode() == GSVideoMode::SDTV_480P, shader_time);
 		}
 
 		EndPresentFrame();
@@ -1673,6 +1779,14 @@ void GSSetPortraitRenderTopAlign(bool enabled)
 void GSSetLandscapeRenderTopAlign(bool enabled)
 {
 	s_landscape_render_top = enabled;
+}
+
+void GSSetSideBySideVR(bool enabled, int size_percent, int distance_percent, int height_percent)
+{
+	s_sbs_vr_size = std::clamp(size_percent, 30, 100);
+	s_sbs_vr_distance = std::clamp(distance_percent, -100, 100);
+	s_sbs_vr_height = std::clamp(height_percent, -100, 100);
+	s_sbs_vr = enabled;
 }
 
 GSTexture* GSRenderer::LookupPaletteSource(u32 CBP, u32 CPSM, u32 CBW, GSVector2i& offset, float* scale, const GSVector2i& size)

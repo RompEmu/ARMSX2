@@ -64,6 +64,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_local_memory_move_tests.cpp
 	gs_local_memory_write_stamp_tests.cpp
 	gs_local_memory_write_source_bounds_tests.cpp
+	gs_readback_block_write_tests.cpp
 	gs_local_memory_four_bit_stream_tests.cpp
 	gs_write_stamp_writer_tests.cpp
 	gs_hash_memo_tests.cpp
@@ -73,6 +74,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_depth_coverage_tests.cpp
 	gs_draw_alpha_mask_tests.cpp
 	gs_fast_stencil_shadow_tests.cpp
+	gs_stencil_counter_tests.cpp
 	gs_sprite_cover_tests.cpp
 	gs_sprite_edge_snap_tests.cpp
 	gs_sprite_pass_order_tests.cpp
@@ -88,7 +90,6 @@ add_pcsx2_test(gs_vertex_tests
 	gs_texture_cache_grid_tests.cpp
 	gs_texture_cache_move_tests.cpp
 	gs_target_update_tests.cpp
-	gs_exact_dirty_mapping_tests.cpp
 	gs_target_rebase_tests.cpp
 	gs_target_rebase_integration_tests.cpp
 	gs_dither_scale_tests.cpp
@@ -99,7 +100,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_field_shift_detector_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
 	gs_sw_palette_block_copy_tests.cpp
-	gs_tc_union_cover_tests.cpp
+	gs_target_dirty_tests.cpp
 	gs_cache_file_tests.cpp
 	gs_hash_cache_inject_tests.cpp
 	gs_hash_cache_limits_tests.cpp

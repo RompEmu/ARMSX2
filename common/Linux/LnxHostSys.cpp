@@ -8,6 +8,7 @@
 #include "common/Error.h"
 #include "common/HostSys.h"
 
+#include <atomic>
 #include <cstdio>
 #include <csignal>
 #include <cerrno>
@@ -174,6 +175,37 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
 void HostSys::DestroySharedMemory(void* ptr)
 {
 	close(static_cast<int>(reinterpret_cast<intptr_t>(ptr)));
+}
+
+bool HostSys::DiscardSharedMemory(void* ptr, size_t offset, size_t size)
+{
+#if defined(__linux__)
+	// shm/memfd memory is tmpfs, so a hole reads back as zeros. Partial pages at the ends get zeroed.
+	const int fd = static_cast<int>(reinterpret_cast<intptr_t>(ptr));
+	return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
+			   static_cast<off_t>(size)) == 0;
+#else
+	return false;
+#endif
+}
+
+void HostSys::DiscardMemory(void* ptr, size_t size)
+{
+#if defined(__linux__)
+	// MADV_DONTNEED frees whole pages (they read back as zeros); partial pages at the ends get zeroed.
+	const uptr begin = reinterpret_cast<uptr>(ptr);
+	const uptr end = begin + size;
+	const uptr pages_begin = Common::AlignUpPow2(begin, __pagesize);
+	const uptr pages_end = Common::AlignDownPow2(end, __pagesize);
+	if (pages_begin < pages_end &&
+		madvise(reinterpret_cast<void*>(pages_begin), pages_end - pages_begin, MADV_DONTNEED) == 0)
+	{
+		std::memset(ptr, 0, pages_begin - begin);
+		std::memset(reinterpret_cast<void*>(pages_end), 0, end - pages_end);
+		return;
+	}
+#endif
+	std::memset(ptr, 0, size);
 }
 
 #ifndef __APPLE__
@@ -367,6 +399,7 @@ namespace PageFaultHandler
 	static std::recursive_mutex s_exception_handler_mutex;
 	static bool s_in_exception_handler = false;
 	static bool s_installed = false;
+	static std::atomic<UnhandledFaultReporter> s_unhandled_fault_reporter{nullptr};
 } // namespace PageFaultHandler
 
 #ifdef ARCH_ARM64
@@ -458,8 +491,17 @@ void PageFaultHandler::SignalHandler(int sig, siginfo_t* info, void* ctx)
 	if (result == HandlerResult::ContinueExecution)
 		return;
 
-	// We couldn't handle it. Pass it off to the crash dumper.
+	// We couldn't handle it. Say what we can about it, then pass it off to the
+	// crash dumper, which hands the signal back to whoever had it before us:
+	// returning from here retries the instruction, and it faults under them.
+	if (const UnhandledFaultReporter reporter = s_unhandled_fault_reporter.load(std::memory_order_acquire))
+		reporter(sig, info, ctx);
 	CrashHandler::CrashSignalHandler(sig, info, ctx);
+}
+
+void PageFaultHandler::SetUnhandledFaultReporter(UnhandledFaultReporter reporter)
+{
+	s_unhandled_fault_reporter.store(reporter, std::memory_order_release);
 }
 
 bool PageFaultHandler::Install(Error* error)
@@ -478,19 +520,24 @@ bool PageFaultHandler::Install(Error* error)
 	sa.sa_flags = SA_SIGINFO | SA_NODEFER;
 	sa.sa_sigaction = SignalHandler;
 
-	if (sigaction(SIGSEGV, &sa, nullptr) != 0)
+	// What we replace is what a crash goes back to (CrashHandler). On Android
+	// that is debuggerd's handler, as ART's sigchain reports it.
+	struct sigaction replaced;
+	if (sigaction(SIGSEGV, &sa, &replaced) != 0)
 	{
 		Error::SetErrno(error, "sigaction() for SIGSEGV failed: ", errno);
 		return false;
 	}
+	CrashHandler::RecordReplacedHandler(SIGSEGV, replaced);
 
 #ifdef ARCH_ARM64
 	// We can get SIGBUS on ARM64.
-	if (sigaction(SIGBUS, &sa, nullptr) != 0)
+	if (sigaction(SIGBUS, &sa, &replaced) != 0)
 	{
 		Error::SetErrno(error, "sigaction() for SIGBUS failed: ", errno);
 		return false;
 	}
+	CrashHandler::RecordReplacedHandler(SIGBUS, replaced);
 #endif
 
 	s_installed = true;

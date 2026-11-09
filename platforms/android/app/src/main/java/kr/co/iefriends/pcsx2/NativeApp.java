@@ -123,6 +123,43 @@ public class NativeApp {
 	/** PNG screenshot into the snapshots folder. No-op with no VM. */
 	public static native void saveScreenshot(String pngPath);
 
+	/**
+	 * GS dump with the output location chosen by the caller, for the problem report. Queues a dump
+	 * of the next [frames] frames whose bundle will be "[basePath].gs.zip" (anything after a
+	 * trailing .gs.zip/.gs/.png on [basePath] is dropped). The zip appears whole once the dump has
+	 * closed, so the caller polls for it. Needs a running VM that draws frames: a paused game never
+	 * opens the dump, so resume it and wait. Blocks until the GS thread has taken the request; not
+	 * for the UI thread. False if there is no VM or a snapshot is already pending.
+	 */
+	public static native boolean captureGsDumpTo(String basePath, int frames);
+
+	/**
+	 * Where the dump queued by captureGsDumpTo has got to, as {phase, vsyncsToOpen, vsyncsToRecorded}
+	 * (null if the array could not be allocated). Phase: 0 idle, 1 queued, 2 recording, 3 packing
+	 * (every frame is recorded, the zip is still being built), 4 done. The vsync counts are GS
+	 * vsyncs since the request, 0 until known. Cheap and safe from any thread.
+	 */
+	public static native long[] getGsDumpStatus();
+
+	/**
+	 * Writes a save state to [path] and nowhere else: it never touches the numbered slots, the
+	 * autosave or their backups. Refused (false) while the memory card is busy, with no game CRC
+	 * or with no VM. Blocks until the file is complete; not for the UI thread.
+	 */
+	public static native boolean saveStateToPath(String path);
+
+	/**
+	 * The GS driver report (the same JSON that sits beside a GS dump) written to [jsonPath]. Works
+	 * with no game running; the renderer sections are then empty. Blocks; not for the UI thread.
+	 */
+	public static native boolean writeSystemReport(String jsonPath);
+
+	/** What the last Vulkan load was asked for and what it got, as JSON. Works with no game. */
+	public static native String getCustomDriverStatus();
+
+	/** fps, speed, thread usage and frame times as JSON. {"valid":false} with no VM. */
+	public static native String getPerfSnapshot();
+
 	// ADPF (PerformanceHintManager): hint the OS to clock the EE/GS threads' cores up toward
 	// the frame deadline instead of the DVFS governor under-clocking emulation. Applies live;
 	// no-op below API 33. Persisted app-side (pref "ui.adpf") and re-applied at startup.
@@ -153,6 +190,11 @@ public class NativeApp {
 	/** Diagnostic: write a line to the native emulog (Console) so it shows in the in-app
 	 *  Save Log export. Used by the Joy-Con input diagnostic; no-ops if the console isn't open. */
 	public static native void emulog(String msg);
+
+	/** True while the core has logs/emulog.txt open for writing. It opens the file when the app
+	 *  starts and again at the boot of each game after the first, and closes it when a game ends.
+	 *  A caller that wants to move the file must wait until this is false. */
+	public static native boolean isEmulogOpen();
 
 	/**
 	 * Live GS-only reconfigure for a running VM. Reloads the whole EmuCore/GS
@@ -286,6 +328,17 @@ public class NativeApp {
 
 	/** Why the last runVMThread could not boot, or "" when it did. */
 	public static native String getLastBootError();
+
+	/** The core's VMBootResult for the last runVMThread that could not boot, BOOT_RESULT_SUCCESS when it did. */
+	public static native int getLastBootResult();
+
+	// VMBootResult values (pcsx2/VMManager.h); native-lib.cpp asserts they match.
+	public static final int BOOT_RESULT_SUCCESS = 0;
+	public static final int BOOT_RESULT_FAILURE = 1;
+	/** No BIOS is set up, or the one that was is gone, and the BIOS folder has no other. */
+	public static final int BOOT_RESULT_BIOS_NOT_FOUND = 3;
+	/** The BIOS file is there but could not be read, or is not a PS2 BIOS. */
+	public static final int BOOT_RESULT_BIOS_NOT_USABLE = 4;
 
 	/** The cabinet controls (ARCADE_MODE_*) the core gives a game ID such as NM00004. */
 	public static native int arcadeModeForGameId(String gameId);
@@ -523,6 +576,21 @@ public class NativeApp {
 			com.armsx2.config.AutoTuneStore.INSTANCE.onCommitted(serial, section, key, value);
 		} catch (Throwable t) {
 			android.util.Log.e("ARMSX2", "onAutoTuneCommitted failed: " + section + "/" + key, t);
+		}
+	}
+	/** The output surface as auto-tune has to see it, pushed from EmulationSurface.applyOutputScale:
+	 *  [hwScaler] is the "Display Resolution (HW scaler)" in effect, an auto-tune trial included (0 = Screen,
+	 *  N = the short side is held to 448 * N), and [baseShortSide] the surface's short side in pixels before
+	 *  the setting shrinks it. */
+	public static native void setOutputScaleState(int hwScaler, int baseShortSide);
+	/** Called from native (the CPU thread) when auto-tune tries a display scale: [value] >= 0 is put in
+	 *  effect in place of the saved setting, -1 hands the surface back to it (AutoTuneStore.onDisplayScale).
+	 *  Nothing may escape: native makes no exception check beyond clearing one. */
+	public static void onAutoTuneDisplayScale(int value) {
+		try {
+			com.armsx2.config.AutoTuneStore.INSTANCE.onDisplayScale(value);
+		} catch (Throwable t) {
+			android.util.Log.e("ARMSX2", "onAutoTuneDisplayScale failed: " + value, t);
 		}
 	}
 	/** What the game database sets for a serial: one line per setting a per-game key can claim,
@@ -1001,6 +1069,11 @@ public class NativeApp {
 	/** Top-align the render in a LANDSCAPE window (foldables / clamshell controllers). */
 	public static native void setLandscapeRenderTop(boolean top);
 
+	/** Side-by-side VR for phone headsets: the game drawn once in each half of the screen.
+	 *  [sizePercent] 30..100 of each half, [distancePercent] and [heightPercent] -100..100 of the
+	 *  room left around the pictures. Applies live. */
+	public static native void setSideBySideVR(boolean enabled, int sizePercent, int distancePercent, int heightPercent);
+
 	/** Pixels to keep clear at the top of a PORTRAIT render for a punch-hole/notch camera. Taken
 	 *  from the window's display cutout; 0 on devices without one. Only affects portrait
 	 *  top-aligned output. */
@@ -1035,6 +1108,13 @@ public class NativeApp {
 	/** Affinity Control Mode: 0 off (scheduler decides), 1-6 EE/VU/GS priority orders,
 	 *  7 Performance Cores. Read when the VM boots — set it before runVMThread. */
 	public static native void setAffinityMode(int mode);
+
+	/**
+	 * Whether the IOP thread setting should start on for this device (IopThread::DefaultOnForHost in the core): the
+	 * performance tier is two or three cores and the core would run the thread. mtvu is the MTVU setting, which counts
+	 * one more thread. Callable before the VM exists.
+	 */
+	public static native boolean iopThreadDefaultOn(boolean mtvu);
 	public static native void renderPreloading(int value);
 
 	/** Flip texture dumping on/off live (PCSX2's ToggleTextureDumping hotkey).
@@ -1116,6 +1196,8 @@ public class NativeApp {
 	 * Returns null if the file isn't a valid BIOS image.
 	 */
 	public static native BiosInfo getBiosInfoFromFd(int fd);
+	/** Whether the file is a PS1 BIOS. Takes ownership of fd, like getBiosInfoFromFd. */
+	public static native boolean isPs1BiosFromFd(int fd);
 
 	/**
 	 * Read enough of a PS2 disc image to extract its serial (e.g.

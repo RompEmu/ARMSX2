@@ -740,6 +740,9 @@ struct TraceLogFilters
 //
 struct Pcsx2Config
 {
+	// Hosts with less RAM than this keep the smaller GIF path 2/3 buffers.
+	static constexpr u64 LOW_MEMORY_HOST_BYTES = 2ull << 30;
+
 	struct ProfilerOptions
 	{
 		BITFIELD32()
@@ -1428,7 +1431,11 @@ struct Pcsx2Config
 			// Let the governor lower the EE cycle rate below EECycleRate, by up to two
 			// steps, when the host cannot hold the frame deadline. Never above it, and
 			// never written back — EECycleRate stays the player's baseline.
-			DynamicEECycleRate : 1;
+			DynamicEECycleRate : 1,
+			// With iopThread: EE-started SIF0/SIF1 DMA does not hold the IOP. The EE posts the pump as an item stamped
+			// with its cycle, and the IOP runs it when its own clock reaches the stamp (IopThread::DeferSifPump). INI
+			// only, no UI, experimental. After DynamicEECycleRate so that no existing bit moves.
+			iopThreadDeferSif : 1;
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)

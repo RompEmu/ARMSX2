@@ -43,7 +43,7 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
         "forceMaliFbFetch", "fsrSharpness", "fxaa", "gpuProfile", "gsBackThreadMode", "hardwareDownloadMode",
         "hwAa1", "hwAccurateAlphaTest", "hwMipmap", "hwRov", "loadTextureReplacements",
         "loadTextureReplacementsAsync", "maxAnisotropy", "orientation",
-        "osdShowTextureReplacements", "portraitRenderTop", "landscapeRenderTop", "autoProgressiveScan",
+        "osdShowTextureReplacements", "portraitRenderTop", "landscapeRenderTop", "vrSideBySide", "vrSize", "vrDistance", "vrHeight", "autoProgressiveScan",
         "precacheTextureReplacements", "renderer",
         "shadeBoost", "shadeBoostBrightness", "shadeBoostContrast", "shadeBoostGamma",
         "shadeBoostSaturation", "shaderChainEnabled", "shaderChainParams", "shaderChainPreset",
@@ -101,11 +101,19 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
     // Controls keeps its binds and tunables in ControllerMappings and has its own reset row.
 )
 
-/** Default values for just this category's fields, leaving every other tab untouched. */
-internal fun Settings.resetCategory(category: SettingsCategory): Settings {
+/**
+ * Default values for just this category's fields, leaving every other tab untouched. The IOP thread's default is the
+ * device's ([iopThreadDefaultOn], asked only when the category owns that field): on where the performance tier is two or
+ * three cores, which `Settings()` alone cannot say.
+ */
+internal fun Settings.resetCategory(
+    category: SettingsCategory,
+    iopThreadDefaultOn: (mtvu: Boolean) -> Boolean = { com.armsx2.DeviceTier.iopThreadDefault(it) },
+): Settings {
     val fields = SETTINGS_CATEGORY_FIELDS[category] ?: return this
     val current = toJson()
     val defaults = Settings().toJson()
+    if ("iopThread" in fields) defaults.put("iopThread", iopThreadDefaultOn(Settings().cpu.mtvu))
     for (key in fields) {
         if (defaults.has(key)) current.put(key, defaults.get(key)) else current.remove(key)
     }

@@ -58,14 +58,32 @@ IopThread::HostCpuInfo IopThread::MakeHostInfo(bool is_arm64, u32 total_cores, u
 	return host;
 }
 
-IopThread::TierPlan IopThread::PlanTier(u64 performance_mask, bool mtvu, bool iop_thread)
+IopThread::TierPlan IopThread::PlanTier(u64 performance_mask, bool mtvu)
 {
 	TierPlan plan;
-	plan.threads_to_place = 2 + (mtvu ? 1 : 0) + (iop_thread ? 1 : 0);
+	plan.threads_to_place = 2 + (mtvu ? 1 : 0);
 	const u32 tier = static_cast<u32>(std::popcount(performance_mask));
 	plan.tier_fits = performance_mask != 0 && tier >= plan.threads_to_place;
 	plan.back_thread_fits = tier >= plan.threads_to_place + 1;
 	return plan;
+}
+
+bool IopThread::OrderedPinAllowed(u64 performance_mask, bool mtvu)
+{
+	return performance_mask == 0 || PlanTier(performance_mask, mtvu).tier_fits;
+}
+
+bool IopThread::GsSplitFits(u32 performance_cores, u32 processors, bool iop_thread_threaded)
+{
+	const u32 needed = 4 + (iop_thread_threaded ? 1 : 0);
+	return performance_cores >= needed && performance_cores < processors;
+}
+
+u64 IopThread::SlowCoresMask(u64 performance_mask, u64 all_mask, bool concurrent)
+{
+	if (!concurrent || performance_mask == 0)
+		return 0;
+	return all_mask & ~performance_mask;
 }
 
 IopThread::RankPlan IopThread::PlanRanks(int affinity_mode, bool mtvu, bool iop_thread, size_t list_size)

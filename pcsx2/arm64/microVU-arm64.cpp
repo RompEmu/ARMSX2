@@ -10,6 +10,7 @@
 #include "vuaot/VuAotTier.h"
 
 #include "microVU-arm64.h"
+#include "arm64/RecCrashReport-arm64.h"
 
 #include "microVU_ProgCache-arm64.h"
 #include "arm64/iCore-arm64.h"
@@ -1260,6 +1261,7 @@ void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle)
 		// space — only the byte stores land in the alias. Identity elsewhere.
 		mVU.jitAsm = std::make_unique<a64::MacroAssembler>(
 			static_cast<vixl::byte*>(armGetWritableCodePtr(mVU.prog.x86start)), blockCacheCapacity);
+		mVU.jitAsm->SetCPUFeatures(armBaselineCPUFeatures());
 		mVU.jitAsm->GetScratchVRegisterList()->Remove(31);
 		mVU.jitAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	}
@@ -2777,4 +2779,43 @@ bool SaveStateBase::vuJITFreeze()
 	Freeze(microVU0.prog.lpState);
 	Freeze(microVU1.prog.lpState);
 	return IsOkay();
+}
+
+//------------------------------------------------------------------
+// Crash post-mortem (RecCrashReport-arm64.h)
+//------------------------------------------------------------------
+
+uptr RecCrashReport::VuBlocksStart(int vu)
+{
+	return reinterpret_cast<uptr>((vu ? microVU1 : microVU0).prog.x86start);
+}
+
+// Blocks record where their code starts but not where it ends, so the best
+// there is: the entry nearest below the pc among the blocks of the program
+// being run. Reads the program's block lists only, on the thread that builds
+// them.
+void RecCrashReport::FindVuBlock(int vu, uptr host_pc, VuHit* hit)
+{
+	microVU& mVU = vu ? microVU1 : microVU0;
+	const microProgram* const prog = mVU.prog.cur;
+	if (!prog)
+		return;
+
+	hit->program = prog->idx;
+	hit->program_start = prog->startPC;
+	for (u32 i = 0; i < mProgSize / 2; i++)
+	{
+		microBlockManager* const manager = prog->block[i];
+		if (!manager)
+			continue;
+		manager->forEachBlock([&](const microBlock& block) {
+			const uptr start = reinterpret_cast<uptr>(block.x86ptrStart);
+			if (start <= host_pc && start > hit->host_start)
+			{
+				hit->found = true;
+				hit->block_pc = i * 8;
+				hit->host_start = start;
+			}
+		});
+	}
 }

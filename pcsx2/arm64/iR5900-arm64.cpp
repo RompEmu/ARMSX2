@@ -27,6 +27,9 @@
 #include "R5900.h"
 #include "IopThread/IopThreadMode.h"
 #include "arm64/BaseblockEx-arm64.h"
+#include "arm64/BlockLut-arm64.h"
+#include "arm64/RecCrashReport-arm64.h"
+#include "arm64/RecErrorReport-arm64.h"
 #include "R5900OpcodeTables.h"
 #include "Common.h"
 #include "VMManager.h"
@@ -105,6 +108,9 @@ static u8* recPtrEnd = nullptr;
 // rec region, so fastmem fault range checks and perf bucketing are unaffected.
 // Bump-allocated; recycled only by the full cache reset, like block memory.
 static u8* s_coldBase = nullptr;
+// Where blocks start: the dispatchers and stubs recResetRaw generates come
+// first. For the crash post-mortem.
+static u8* s_blocksStart = nullptr;
 static u8* s_coldPtr = nullptr;
 static u8* s_coldPtrEnd = nullptr;
 
@@ -124,7 +130,7 @@ static bool s_nBlockFF;
 // Exposed for the LDL/LDR fusion in recVTLB-arm64.cpp (same-block partner check).
 u32 recCurrentBlockEndPC() { return s_nEndBlock; }
 
-static DynamicHeapArray<BASEBLOCK, 4096> recLutReserve_RAM;
+static BlockLut recLutReserve_RAM;
 static DynamicHeapArray<BASEBLOCK, 4096> recLutUnmapped;
 static DynamicHeapArray<u8> recRAMCopy;
 static size_t recLutEntries = 0;
@@ -166,12 +172,20 @@ static u8 manual_counter[Ps2MemSize::TotalRam / 4096] = {};
 // Forward declarations
 static void recRecompile(const u32 startpc);
 static void recResetRaw();
-static void recExitExecution();
+[[noreturn]] static void recExitExecution();
 static void recSafeExitExecution();
 #ifdef PCSX2_RECOMPILER_TESTS
 static bool harnessShouldExit();
 #endif
-static void recError(u32 error);
+// recError's codes. RecErrorExit passes w0-w2 through as its arguments.
+enum RecErrorCode : u32
+{
+	kRecErrorUnmappedPage = 0,
+	kRecErrorUnalignedJump = 1, // jump_pc and jump_rs are the jump's; its target is in cpuRegs.pc
+	kRecErrorUnalignedEntry = 2, // the pc was unaligned on entry; the others are unused
+	kRecErrorUnalignedEret = 3, // jump_pc is the ERET's; it returned to cpuRegs.pc
+};
+[[noreturn]] static void recError(u32 error, u32 jump_pc, u32 jump_rs);
 static void dyna_block_discard(u32 start, u32 sz);
 static void dyna_page_reset(u32 start, u32 sz);
 static void iopClearRecLUT(BASEBLOCK* base, int count);
@@ -195,6 +209,7 @@ static const void* EnterRecompiledCode = nullptr;
 static const void* DispatchBlockDiscard = nullptr;
 static const void* DispatchPageReset = nullptr;
 static const void* UnmappedRecLUTPage = nullptr;
+static const void* RecErrorExit = nullptr;
 
 // B.cond and CBZ reach ±1MB. The dispatchers are generated at the base of a
 // code cache tens of megabytes deep, so past its first megabyte the event
@@ -488,11 +503,26 @@ static const void* _DynGen_DispatchPageReset()
 	return retval;
 }
 
+// Every recLUT entry of an unmapped page points here. Falls into RecErrorExit.
 static const void* _DynGen_UnmappedRecLUTPage()
 {
 	u8* retval = armGetCurrentCodePointer();
 	armAsm->Mov(RWARG1, 0);
-	armEmitCall((void*)(void(*)(u32))recError);
+	return retval;
+}
+
+// Leaves generated code for good through recError, with w0-w2 its arguments
+// (w0 the code). Jumped to, not called. recExitExecution restores only the host
+// registers fastjmp_set saved, so the cycle count and the pinned guest
+// registers are stored first, as DispatcherEvent does before an exit from
+// recEventTest.
+static const void* _DynGen_RecErrorExit()
+{
+	u8* retval = armGetCurrentCodePointer();
+	armFlushCycleDelta();
+	armFlushEEGPRPins();
+	armEmitCall((void*)recError);
+	armAsm->Brk(0); // recError does not return
 	return retval;
 }
 
@@ -556,6 +586,7 @@ static void _DynGen_Dispatchers()
 	DispatchBlockDiscard = _DynGen_DispatchBlockDiscard();
 	DispatchPageReset = _DynGen_DispatchPageReset();
 	UnmappedRecLUTPage = _DynGen_UnmappedRecLUTPage();
+	RecErrorExit = _DynGen_RecErrorExit(); // must follow UnmappedRecLUTPage
 
 	// Block linker: stale / not-yet-compiled link sites divert to
 	// DispatcherReg — re-dispatch from the pc the site's tail already
@@ -572,23 +603,50 @@ static void _DynGen_Dispatchers()
 //  Error handling
 // =====================================================================================================
 
-static void recError(u32 error)
+[[noreturn]] static void recError(u32 error, u32 jump_pc, u32 jump_rs)
 {
-	switch (error)
+	if (error == kRecErrorUnmappedPage)
 	{
-		case 0:
-			Host::ReportErrorAsync("R5900 Exception",
-				fmt::format("Unrecognized opcode (PC: 0x{:08x})", cpuRegs.pc));
-			break;
-
-		case 1:
-			Host::ReportErrorAsync("R5900 Exception",
-				fmt::format("Jump to unaligned address (PC: 0x{:08x})", cpuRegs.pc));
-			break;
+		Host::ReportErrorAsync("R5900 Exception",
+			fmt::format("Jump to unmapped recLUT page (PC: 0x{:08x})", cpuRegs.pc));
+		RecErrorReport::LogEe(RecErrorReport::Kind::UnmappedPage, std::nullopt);
+	}
+	else if (error == kRecErrorUnalignedEret)
+	{
+		Host::ReportErrorAsync("R5900 Exception",
+			fmt::format("ERET to unaligned address (PC: 0x{:08x})", cpuRegs.pc));
+		RecErrorReport::LogEeEret(jump_pc);
+	}
+	else
+	{
+		Host::ReportErrorAsync("R5900 Exception",
+			fmt::format("Jump to unaligned address (PC: 0x{:08x})", cpuRegs.pc));
+		std::optional<RecErrorReport::Jump> jump;
+		if (error == kRecErrorUnalignedJump)
+			jump = RecErrorReport::Jump{jump_pc, jump_rs, cpuRegs.pc};
+		RecErrorReport::LogEe(RecErrorReport::Kind::UnalignedJump, jump);
 	}
 
+	// Runs on the EE thread with fastjmp_set armed, so it can leave at once.
+	// Cpu->ExitExecution only sets the flag the next event test reads, and the
+	// generated code that called this has no path back to an event test.
 	VMManager::SetPaused(true);
-	Cpu->ExitExecution();
+	recExitExecution();
+}
+
+void recEmitEretTargetCheck(u32 eret_pc)
+{
+	// ERET takes the pc from EPC or ErrorEPC, which the guest can set to
+	// anything. The pins and the cycle count are live in their registers here
+	// (recBranchCallNoGprWrite reloaded them), which RecErrorExit expects. The
+	// error path is out of line: three instructions on the normal one.
+	armAsm->Ldr(RWSCRATCH, armCpuRegMem(&cpuRegs.pc));
+	armAsm->Tst(RWSCRATCH, 3);
+	recEmitColdIslandBranch(a64::ne, [eret_pc]() {
+		armAsm->Mov(a64::w1, eret_pc);
+		armAsm->Mov(RWARG1, kRecErrorUnalignedEret);
+		armEmitJmp(RecErrorExit);
+	});
 }
 
 // =====================================================================================================
@@ -1635,7 +1693,7 @@ static void emitCycleUpdateAndEventCheck()
 	emitDispatcherCondBranch(a64::ge, DispatcherEvent, s_condVeneerEvent);
 }
 
-void SetBranchReg(EEBranchRegMode mode, u32 call_return_pc, int wbreg)
+void SetBranchReg(EEBranchRegMode mode, u32 call_return_pc, int wbreg, u32 jump_pc, u32 jump_rs)
 {
 	const Cop2VfCacheScope vfCacheScope; // fork tail: preserve compile-time cache state
 	g_branch = 1;
@@ -1766,9 +1824,13 @@ void SetBranchReg(EEBranchRegMode mode, u32 call_return_pc, int wbreg)
 		armEmitJmp(DispatcherReg);
 	}
 
+	// recError's arguments. The target it reports is the one stored to
+	// cpuRegs.pc above.
 	armAsm->Bind(&unaligned);
-	armAsm->Mov(RWARG1, 1);
-	armEmitCall((void*)recError);
+	armAsm->Mov(a64::w1, jump_pc);
+	armAsm->Mov(a64::w2, jump_rs);
+	armAsm->Mov(RWARG1, kRecErrorUnalignedJump);
+	armEmitJmp(RecErrorExit);
 }
 
 // =====================================================================================================
@@ -1931,6 +1993,17 @@ static void SetBranchBackedge()
 #endif
 }
 
+// A fast-forward is about to jump to DispatcherEvent: tell the event test that is the way it is reached (eeFastForwardKind). One
+// byte store through a scratch address register, on a path that costs a whole event test anyway. Clobbers RWSCRATCH and RSCRATCHADDR;
+// every caller has flushed.
+static void emitNoteFastForward(u8 kind)
+{
+	armMoveAddressToReg(RSCRATCHADDR, &eeFastForwardKind);
+	armAsm->Ldrb(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
+	armAsm->Orr(RWSCRATCH, RWSCRATCH, kind);
+	armAsm->Strb(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
+}
+
 void SetBranchImm(u32 imm)
 {
 	if (s_loopResident && !s_loopBackedgeEmitted && imm == s_loopTopPc)
@@ -1970,6 +2043,7 @@ void SetBranchImm(u32 imm)
 		recEeNoteChargeSite(EeChargeSite::WaitLoopFastFwd);
 		armAsm->Cmp(RECCYCLE, 0);
 		armAsm->Csel(RECCYCLE, RECCYCLE, a64::xzr, a64::gt);
+		emitNoteFastForward(IopThread::FastForward::WaitLoop); // the flags are dead: DispatcherEvent does not read them
 		armEmitJmp(DispatcherEvent);
 		return;
 	}
@@ -3723,8 +3797,7 @@ static void recReserveRAM()
 	s_reservedRam = Ps2MemSize::ExposedRam;
 	recLutEntries = (Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4;
 
-	if (recLutReserve_RAM.size() != recLutEntries)
-		recLutReserve_RAM.resize(recLutEntries);
+	recLutReserve_RAM.Resize(recLutEntries);
 
 	recLutUnmapped.resize(_64kb / 4);
 
@@ -3872,13 +3945,13 @@ static void recResetRaw()
 
 	const u8* dispEnd = armGetCurrentCodePointer();
 	recPtr = armEndBlock();
+	s_blocksStart = recPtr;
 
 	s_coldPtr = s_coldBase;
 
 	Console.WriteLn(Color_Green, "EE ARM64: Dispatcher generated at %p (%zu bytes)", dispStart, (size_t)(dispEnd - dispStart));
 
-	iopClearRecLUT(recLutReserve_RAM.data(),
-		Ps2MemSize::ExposedRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);
+	recLutReserve_RAM.Reset((uptr)JITCompile);
 
 	BASEBLOCK* unmapped = recLutUnmapped.data();
 
@@ -3960,8 +4033,9 @@ static void recResetRaw()
 
 	memset(manual_page, 0, sizeof(manual_page));
 	memset(manual_counter, 0, sizeof(manual_counter));
+	// Discard instead of memset, which would keep all 32 MB resident.
 	if (recRAMCopy.data())
-		memset(recRAMCopy.data(), 0, recRAMCopy.size());
+		HostSys::DiscardMemory(recRAMCopy.data(), recRAMCopy.size());
 
 	g_branch = 0;
 
@@ -4211,7 +4285,7 @@ static void recShutdown()
 
 	s_eeConstantPool.Destroy();
 	recRAMCopy.deallocate();
-	recLutReserve_RAM.deallocate();
+	recLutReserve_RAM.Free();
 	recLutUnmapped.deallocate();
 
 	safe_free(s_pInstCache);
@@ -4220,8 +4294,37 @@ static void recShutdown()
 	recPtr = nullptr;
 	recPtrEnd = nullptr;
 	s_coldBase = nullptr;
+	s_blocksStart = nullptr;
 	s_coldPtr = nullptr;
 	s_coldPtrEnd = nullptr;
+}
+
+RecCrashReport::RecSlices RecCrashReport::EeSlices()
+{
+	RecSlices slices;
+	slices.blocks_start = reinterpret_cast<uptr>(s_blocksStart);
+	slices.cold_start = reinterpret_cast<uptr>(s_coldBase);
+	// recReserve puts the cold arena's end one slop below the constant pool.
+	slices.pool_start = s_coldPtrEnd ? reinterpret_cast<uptr>(s_coldPtrEnd) + _64kb : 0;
+	return slices;
+}
+
+bool RecCrashReport::FindEeBlock(uptr host_pc, BlockHit* hit)
+{
+	const BASEBLOCKEX* block = recBlocks.FindByHostPc(host_pc);
+	if (!block)
+		return false;
+	hit->guest_pc = block->startpc;
+	hit->guest_words = block->size;
+	hit->host_start = block->fnptr;
+	hit->host_size = block->x86size;
+	return true;
+}
+
+void RecCrashReport::EePinnedRegisters(const u64 host_x[31], u64 gpr[32])
+{
+	for (const EEPinnedGPR& pin : kEEPinTable)
+		gpr[pin.gpr] = host_x[pin.host.GetCode()];
 }
 
 static void recResetEE()
@@ -4240,7 +4343,7 @@ static void recStep()
 {
 }
 
-static void recExitExecution()
+[[noreturn]] static void recExitExecution()
 {
 	fastjmp_jmp(&m_SetJmp_StateCheck, 1);
 }
@@ -4277,6 +4380,18 @@ static void recCancelInstruction()
 	// rec-reachable caller is RaiseAddressError, which just logs.
 }
 
+// Runs generated code from cpuRegs.pc until something calls recExitExecution;
+// fastjmp_set must be armed. DispatcherReg finds a block with an 8-byte load at
+// pc * 2 into the page's table, which reads the right entry only when pc is a
+// multiple of 4. A jump to an unaligned address stops with pc at that address
+// (SetBranchReg), so the entry after it, a Resume, reports the error again.
+static void recEnterRecompiledCode()
+{
+	if (cpuRegs.pc & 3) [[unlikely]]
+		recError(kRecErrorUnalignedEntry, 0, 0);
+	((void (*)())EnterRecompiledCode)();
+}
+
 static void recExecute()
 {
 	if (eeRecNeedsReset)
@@ -4299,7 +4414,7 @@ static void recExecute()
 	if (!fastjmp_set(&m_SetJmp_StateCheck))
 	{
 		eeCpuExecuting = true;
-		((void (*)())EnterRecompiledCode)();
+		recEnterRecompiledCode();
 	}
 
 	eeCpuExecuting = false;
@@ -4326,7 +4441,7 @@ s32 recEeExecuteBlock(s32 cycles, u32 park_pc)
 
 	if (!fastjmp_set(&m_SetJmp_StateCheck))
 	{
-		((void (*)())EnterRecompiledCode)();
+		recEnterRecompiledCode();
 	}
 
 	g_eeHarnessActive = false;
@@ -4504,8 +4619,15 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 	armAsm->Sxtw(a64::x9, a64::w9);
 	armStoreEERegPtr(a64::x9, &cpuRegs.GPR.r[reg].UD[0]);
 
-	// if reg != 0, event interrupted the loop — go to dispatcher
-	armEmitCbnz(a64::w9, DispatcherEvent);
+	// if reg != 0, event interrupted the loop — go to dispatcher. The jump ended in the event the loop was waiting out, so it is a
+	// fast-forward as far as the event test is concerned; a loop that ran to its end is not (the clock went by its own cost).
+	{
+		a64::Label loop_finished;
+		armAsm->Cbz(a64::w9, &loop_finished);
+		emitNoteFastForward(IopThread::FastForward::TimeoutLoop);
+		armEmitJmp(DispatcherEvent);
+		armAsm->Bind(&loop_finished);
+	}
 
 	// Loop finished — set PC to end of block and dispatch
 	armAsm->Mov(RWSCRATCH, s_nEndBlock);

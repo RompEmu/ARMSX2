@@ -70,6 +70,8 @@ namespace
 			committed.emplace_back(section, key, value);
 		}
 
+		void SetDisplayScale(int value) override { display_scale_calls.push_back(value); }
+
 		// What the emulator would read for a key right now.
 		std::string Effective(const char* section, const char* key) const { return m_stack.GetStringValue(section, key, "<none>"); }
 
@@ -83,6 +85,7 @@ namespace
 		std::vector<std::string> messages;
 		std::vector<std::string> logs;
 		std::vector<std::tuple<std::string, std::string, std::string>> committed;
+		std::vector<int> display_scale_calls; // every value the host was given, -1 for "back to the saved setting"
 
 	private:
 		LayeredSettingsInterface m_stack;
@@ -425,6 +428,116 @@ TEST(AutoTuneApplier, BeginEmptiesTheLayerAndLoadsTheRememberedFailures)
 	EXPECT_TRUE(f.applier.TrialLayer()->IsEmpty());
 }
 
+TEST(AutoTuneApplier, TheDisplayScaleGoesToTheHostAndNotThroughTheSettings)
+{
+	Fixture f;
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+
+	EXPECT_TRUE(f.applier.TrialActive());
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2}));
+	EXPECT_EQ(f.env.applies, 0) << "there is no setting for ApplySettings to rebuild";
+	EXPECT_TRUE(f.applier.TrialLayer()->IsEmpty());
+	EXPECT_EQ(f.env.edits, 0);
+	ASSERT_EQ(f.env.messages.size(), 1u);
+	EXPECT_NE(f.env.messages[0].find("display resolution 2x PS2"), std::string::npos) << f.env.messages[0];
+
+	// Any other lever leaves the host alone.
+	Fixture g;
+	g.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::Resolution, 2.0));
+	EXPECT_TRUE(g.env.display_scale_calls.empty());
+}
+
+TEST(AutoTuneApplier, EveryWayATrialOfTheDisplayScaleEndsHandsTheSurfaceBack)
+{
+	for (const int end : {0, 1, 2, 3, 4}) // measured, inconclusive, retry, cancelled, CancelTrial()
+	{
+		Fixture f;
+		f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+		if (end == 4)
+		{
+			f.applier.CancelTrial(true);
+		}
+		else
+		{
+			AutoTuneAction undo = Action(Kind::Revert, AutoTuneLever::DisplayScale, 2.0);
+			undo.measured = end == 0;
+			undo.inconclusive = end == 1 || end == 2;
+			undo.retry = end == 2;
+			f.applier.Execute(undo);
+		}
+
+		EXPECT_FALSE(f.applier.TrialActive()) << end;
+		EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2, -1})) << "ended " << end;
+		EXPECT_EQ(f.env.applies, 0) << "ended " << end;
+		EXPECT_TRUE(f.env.committed.empty()) << "ended " << end;
+		EXPECT_TRUE(AutoTune::ReadChanges(f.env.game_file).empty()) << "ended " << end;
+	}
+}
+
+TEST(AutoTuneApplier, AMeasuredFailureOfTheDisplayScaleIsWrittenDown)
+{
+	Fixture f;
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+	f.applier.Execute(Action(Kind::Revert, AutoTuneLever::DisplayScale, 2.0));
+
+	ASSERT_EQ(f.applier.Rejections().size(), 1u);
+	EXPECT_EQ(f.applier.Rejections()[0].lever, AutoTuneLever::DisplayScale);
+	const std::vector<AutoTuneRejection> saved = AutoTune::ReadRejected(f.env.game_file);
+	ASSERT_EQ(saved.size(), 1u);
+	EXPECT_EQ(saved[0].lever, AutoTuneLever::DisplayScale);
+	EXPECT_EQ(saved[0].value, 2.0);
+}
+
+TEST(AutoTuneApplier, ASavedDisplayScaleIsLeftToTheHostToEnd)
+{
+	// The host stores the value on its own thread after being told, and ends its override then. Handing the surface
+	// back here would step it to the old size in between.
+	Fixture f;
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+	f.applier.Execute(Action(Kind::Keep, AutoTuneLever::DisplayScale, 2.0));
+
+	EXPECT_FALSE(f.applier.TrialActive());
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2}));
+	ASSERT_EQ(f.env.committed.size(), 1u);
+	EXPECT_EQ(std::get<0>(f.env.committed[0]), GS);
+	EXPECT_EQ(std::get<1>(f.env.committed[0]), "HWScaler");
+	EXPECT_TRUE(AutoTune::SameValue(std::get<2>(f.env.committed[0]), "2"));
+	EXPECT_EQ(f.env.game_file.GetIntValue(GS, "HWScaler", -1), 2);
+	EXPECT_EQ(f.env.applies, 0);
+
+	// The game ends: one more hand-back, so a host that could not save the value does not keep the surface at it
+	// into the next game. For a host that did save it, it changes nothing.
+	f.applier.End();
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2, -1}));
+}
+
+TEST(AutoTuneApplier, ADisplayScaleKeptForTheSessionOnlyIsHandedBackWhenTheGameEnds)
+{
+	Fixture f;
+	f.env.has_file = false;
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+	f.applier.Execute(Action(Kind::Keep, AutoTuneLever::DisplayScale, 2.0));
+
+	EXPECT_TRUE(f.env.committed.empty());
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2})) << "it holds for now";
+
+	f.applier.End();
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({2, -1})) << "and not into the next game";
+}
+
+TEST(AutoTuneApplier, AnUndoneTrialGoesBackToTheSessionValueNotTheSavedOne)
+{
+	Fixture f;
+	f.env.has_file = false;
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 3.0));
+	f.applier.Execute(Action(Kind::Keep, AutoTuneLever::DisplayScale, 3.0));
+
+	// Later the render comes down and the output is tried at 2x PS2; that does not help.
+	f.applier.Execute(Action(Kind::StartTrial, AutoTuneLever::DisplayScale, 2.0));
+	f.applier.Execute(Action(Kind::Revert, AutoTuneLever::DisplayScale, 2.0));
+	EXPECT_EQ(f.env.display_scale_calls, std::vector<int>({3, 2, 3}));
+}
+
 TEST(AutoTuneApplier, EveryLeverWritesTheKeyTheConfigurationReads)
 {
 	Fixture f;
@@ -528,20 +641,41 @@ TEST(AutoTuneHost, TheGsBackThreadCountsAsABusyCore)
 {
 	IopThread::HostCpuInfo host;
 	host.is_arm64 = true;
-	host.total_cores = 6;
+	host.total_cores = 5;
 	host.performance_cores = 3;
 	const IopThread::VmConditions vm;
 
-	// EE, GS and IOP fit on three performance cores, and six cores leave two for the rest...
+	// EE, GS and IOP, and five cores leave two for the rest...
 	EXPECT_TRUE(AutoTune::IopThreadPlaceable(false, false, host, vm, false));
 	// ...but not once the back thread has one of them.
 	EXPECT_FALSE(AutoTune::IopThreadPlaceable(false, false, host, vm, true));
 
 	// MTVU makes it four threads.
-	host.total_cores = 8;
+	host.total_cores = 6;
 	host.performance_cores = 4;
 	EXPECT_TRUE(AutoTune::IopThreadPlaceable(true, false, host, vm, false));
 	EXPECT_FALSE(AutoTune::IopThreadPlaceable(true, false, host, vm, true));
+}
+
+TEST(AutoTuneHost, AHostWithTwoBigCoresAndSixLittleOnesCanHaveTheIopThread)
+{
+	// The RG 55G1. The IOP thread runs on the little cores, so the two big cores do not rule it out, with MTVU on or
+	// off, and with the GS back thread running (seven cores are left for EE, GS, IOP, VU1 and two more).
+	IopThread::HostCpuInfo host;
+	host.is_arm64 = true;
+	host.total_cores = 8;
+	host.performance_cores = 2;
+	const IopThread::VmConditions vm;
+
+	EXPECT_TRUE(AutoTune::IopThreadPlaceable(true, false, host, vm, false));
+	EXPECT_TRUE(AutoTune::IopThreadPlaceable(false, false, host, vm, false));
+	EXPECT_TRUE(AutoTune::IopThreadPlaceable(true, false, host, vm, true));
+	EXPECT_TRUE(AutoTune::IopThreadPlaceable(false, false, host, vm, true));
+
+	// One big core is not a tier: ResolveMode wants at least IopThread::kMinPerformanceCores, so the lever is not offered.
+	host.performance_cores = 1;
+	EXPECT_FALSE(AutoTune::IopThreadPlaceable(true, false, host, vm, true));
+	EXPECT_FALSE(AutoTune::IopThreadPlaceable(false, false, host, vm, false));
 }
 
 TEST(AutoTuneHost, TheGsBackThreadIsNotOfferedWhereItWouldShareABusyCore)
@@ -717,7 +851,7 @@ namespace
 			AutoTuneLeverState s;
 			s.hw_renderer = true;
 			s.resolution = Num(fixture.env.Effective(GS, "upscale_multiplier"), 1.0);
-			s.download_mode = AutoTuneDownloadMode::NoReadbacks;
+			s.download_mode = AutoTuneDownloadMode::Disabled;
 			s.iop_thread_on = IsOn(fixture.env.Effective(SPEED, "iopThread"));
 			s.iop_thread_placeable = true;
 			s.ee_governor_on = IsOn(fixture.env.Effective(SPEED, "DynamicEECycleRate"));

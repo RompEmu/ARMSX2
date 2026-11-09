@@ -129,6 +129,8 @@ enum class DriverBug : u8
 	/// The trigger is run history, not anything the draw carries, so it cannot be probed at
 	/// start-up and no emission order avoids it.
 	BrokenBlendConstant,
+	/// The shader compiler crashes on any pipeline that queries an image size (textureSize).
+	BrokenImageQuery,
 	Count,
 };
 
@@ -175,6 +177,9 @@ enum class DriverWorkaround : u8
 	/// extensions stay enabled, only their use is off. No rule declares it yet: it is the switch
 	/// that excludes one driver without new code.
 	ReadBackRemotePlayFrames,
+	/// Take texture sizes from a uniform or push constant instead of textureSize(). The utility shaders
+	/// always do; tfx.glsl's anisotropic filter only does with this bit set.
+	PassTextureSizeInUniform,
 	Count,
 };
 
@@ -269,6 +274,15 @@ struct MobileDriverProfile
 	/// different picture on each run, so it keeps them.
 	bool prefers_declared_loop_with_barriers = false;
 
+	/// Only the destination-alpha draws that the stencil-one mode would otherwise serve with a stencil
+	/// setup pass take the declared loop with a barrier; every other self-read stays on the copy
+	/// road. Weaker than both facts above, which put every self-read in the pass and win if set.
+	///
+	/// True for Turnip on the Adreno 613. On its copy road each such draw ends the pass twice (about
+	/// 1,070 a frame in Stuntman); the full declared loop removes that but renders other titles
+	/// differently from run to run, so the loop is kept to these draws.
+	bool prefers_declared_loop_for_destination_alpha = false;
+
 	std::string driver_name;
 
 	constexpr bool HasBug(DriverBug bug) const
@@ -328,7 +342,7 @@ constexpr u32 VULKAN_PUSH_DESCRIPTORS_REQUIRED = 7;
 /// Vulkan device rules keyed on the device's own identity (vendor ID, device name, driver ID,
 /// driverInfo) rather than matched in the driver-bug database. Each keeps the exact condition the
 /// backend has always applied, which is not always the database's: the push-descriptor rule covers
-/// Mali on every driver but malisx2, where the database names Arm's.
+/// Mali on every driver but malisx2 and PanVK, where the database names Arm's.
 struct VulkanDeviceRules
 {
 	/// Mali-G615: timestamp queries never resolve, and the present spin that waits on them stalls.
@@ -344,7 +358,7 @@ struct VulkanDeviceRules
 	///     the tile first; measured ~0.1 ms per barrier on a Pixel 11 Pro (CXTP-48-1536), ~3500 per
 	///     frame in NFS Underground at Full blending. subpassLoad keeps the read in the tile.
 	bool avoid_feedback_loop_layout = false;
-	/// Mali crashes inside vkCmdPushDescriptorSetKHR. Adreno is trusted with push descriptors on the
+	/// Arm's Mali driver crashes inside vkCmdPushDescriptorSetKHR. Adreno is trusted with push descriptors on the
 	/// Qualcomm driver and Turnip only. malisx2 is exempt when it advertises the extension with
 	/// enough descriptors (exempt_malisx2_push_descriptors).
 	bool avoid_push_descriptors = false;

@@ -332,6 +332,51 @@ fun RendererTab(state: MutableState<Settings>) {
                 field = "landscapeRenderTop",
             )
             SettingsDivider()
+            // Side-by-side VR for phone headsets: the game drawn once in each half of the screen.
+            // Live via NativeApp.setSideBySideVR (through applyTo). The sliders only move the two
+            // pictures, so they show only while it is on.
+            ToggleRow(
+                str("renderer.vr.label"),
+                s.output.vrSideBySide,
+                description = str("renderer.vr.description"),
+                field = "vrSideBySide",
+            ) {
+                apply(s.copy(output = s.output.copy(vrSideBySide = it)))
+            }
+            if (s.output.vrSideBySide) {
+                IntSliderRow(
+                    label = str("renderer.vr.size"),
+                    value = s.output.vrSize,
+                    min = 30,
+                    max = 100,
+                    description = str("renderer.vr.size.description"),
+                    valueFormatter = { "${it}%" },
+                    onReset = { apply(s.copy(output = s.output.copy(vrSize = 80))) },
+                    field = "vrSize",
+                    onChange = { apply(s.copy(output = s.output.copy(vrSize = it))) },
+                )
+                IntSliderRow(
+                    label = str("renderer.vr.distance"),
+                    value = s.output.vrDistance,
+                    min = -100,
+                    max = 100,
+                    description = str("renderer.vr.distance.description"),
+                    onReset = { apply(s.copy(output = s.output.copy(vrDistance = 0))) },
+                    field = "vrDistance",
+                    onChange = { apply(s.copy(output = s.output.copy(vrDistance = it))) },
+                )
+                IntSliderRow(
+                    label = str("renderer.vr.height"),
+                    value = s.output.vrHeight,
+                    min = -100,
+                    max = 100,
+                    description = str("renderer.vr.height.description"),
+                    onReset = { apply(s.copy(output = s.output.copy(vrHeight = 0))) },
+                    field = "vrHeight",
+                    onChange = { apply(s.copy(output = s.output.copy(vrHeight = it))) },
+                )
+            }
+            SettingsDivider()
             // Auto Progressive Scan — holds Triangle+Cross through boot, the combo some titles
             // probe to offer 480p progressive. Takes effect on the next boot (it is a boot-time
             // pad hold, not a live setting), and only does anything on games that implement it.
@@ -1133,8 +1178,11 @@ private fun GsDumpCaptureRow() {
                 if (MainActivityRuntime.eState.value == com.armsx2.EmuState.STOPPED) {
                     Toast.makeText(context, I18n.get("renderer.gsDump.startGameFirst"), Toast.LENGTH_LONG).show()
                 } else {
-                    runCatching { NativeApp.captureGsDump(1) }
-                    Toast.makeText(context, I18n.get("renderer.gsDump.queued"), Toast.LENGTH_LONG).show()
+                    // The same choice as the pause menu's: keep the dump, or send it with a report.
+                    com.armsx2.ui.bugreport.askGsDumpChoice {
+                        runCatching { NativeApp.captureGsDump(1) }
+                        Toast.makeText(context, I18n.get("renderer.gsDump.queued"), Toast.LENGTH_LONG).show()
+                    }
                 }
             }
             .padding(horizontal = 6.dp, vertical = 5.dp),

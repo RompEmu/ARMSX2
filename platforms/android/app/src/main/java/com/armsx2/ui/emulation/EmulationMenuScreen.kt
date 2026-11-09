@@ -689,10 +689,19 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
             // a GS dump is what gets asked for when someone reports a graphics bug, and this is
             // one tap from the game. It also resumes, because the dump is of the NEXT frame the GS
             // draws, and none is drawn while this menu holds the game paused.
+            //
+            // It is now a choice: keep the dump in the snaps folder as before, or start a problem
+            // report with a fresh dump of this scene.
             MenuAction(str("renderer.gsDump.label"), str("gsdump.quick.detail"), "⧉", null) {
-                runCatching { kr.co.iefriends.pcsx2.NativeApp.captureGsDump(1) }
-                android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
-                viewModel.resume()
+                com.armsx2.ui.bugreport.askGsDumpChoice {
+                    runCatching { kr.co.iefriends.pcsx2.NativeApp.captureGsDump(1) }
+                    android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
+                    viewModel.resume()
+                }
+            },
+            // Best place to report graphics and slowness: the scene is still here to capture.
+            MenuAction(str("bugreport.menu.title"), str("bugreport.menu.detail"), "⚑", null) {
+                com.armsx2.ui.bugreport.BugReportFlow.openInGame(context)
             },
         ) + arcadeActions(viewModel) + listOf(
             MenuAction(str("action.close"), MainActivityRuntime.currentGame.value?.title.orEmpty(), "■", Danger) {
@@ -1163,6 +1172,34 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     MenuSwitchRow(str("fixes.syncToHostRefresh.label"), settings.display.syncToHostRefresh, field = "syncToHostRefresh") {
         viewModel.updateSettings { current -> current.copy(display = current.display.copy(syncToHostRefresh = it)) }
     }
+    // Side-by-side VR, here as well as in Settings so it can be set up against the game itself.
+    MenuSwitchRow(str("renderer.vr.label"), settings.output.vrSideBySide, field = "vrSideBySide") {
+        viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrSideBySide = it)) }
+    }
+    if (settings.output.vrSideBySide) {
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.size"),
+            value = settings.output.vrSize,
+            min = 30,
+            max = 100,
+            valueFormatter = { "${it}%" },
+            field = "vrSize",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrSize = v)) } }
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.distance"),
+            value = settings.output.vrDistance,
+            min = -100,
+            max = 100,
+            field = "vrDistance",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrDistance = v)) } }
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.height"),
+            value = settings.output.vrHeight,
+            min = -100,
+            max = 100,
+            field = "vrHeight",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrHeight = v)) } }
+    }
     // RetroArch shaders, end-to-end in-game: toggle → pick a preset → download more.
     // Same composables the Settings renderer tab renders (single definition in ui/common);
     // only the save lambda differs. updateSettings routes through InGameOverlay.saveSettings,
@@ -1397,7 +1434,9 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
             onSelect = TouchControls::chooseVisibility,
         )
         // Auto and Auto-hide change by themselves, so say what they are doing right now.
+        // Off a handheld, Auto goes by the last button press, which no line here can state.
         val status = when {
+            visibilityMode == TouchControls.VISIBILITY_AUTO && !TouchControls.autoFollowsGamepad -> null
             visibilityMode == TouchControls.VISIBILITY_AUTO && gamepadAttached ->
                 str("pad.onScreenControls.nowHidden")
             visibilityMode == TouchControls.VISIBILITY_AUTO -> str("pad.onScreenControls.nowShown")

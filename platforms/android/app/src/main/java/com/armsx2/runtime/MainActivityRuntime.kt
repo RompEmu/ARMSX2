@@ -642,6 +642,26 @@ open class MainActivityRuntime : ComponentActivity() {
          *  LAUNCHER rotation (reported as "BIOS ignores the Renderer rotation and goes portrait"). */
         private var emulationOwnsOrientation = false
 
+        /** Writes the crash marker for the VM about to run: which game, which GPU driver, and the disc's CRC.
+         *
+         *  The CRC is worked out from the image here, before the VM exists, because the running VM
+         *  reports 0 for some ISO and CHD boots and a crash report wants it. This is the only point
+         *  it can be read without the VM's one CDVD being busy (see DiscIdentity); the result is
+         *  memoised, so a repeat boot of the same file costs nothing. [identifyDisc] is false for a
+         *  BIOS boot (no disc) and an arcade launch (not a disc image). */
+        private fun armBugReportMarker(identifyDisc: Boolean = true) {
+            runCatching {
+                val game = currentGame.value
+                val crc = if (identifyDisc) runCatching { com.armsx2.DiscIdentity.crcOf(m_szGamefile) }.getOrNull().orEmpty() else ""
+                com.armsx2.bugreport.BugReport.armCrashMarker(
+                    serial = game?.serial.orEmpty(),
+                    title = game?.title ?: "BIOS",
+                    driverId = customDriverId.value.orEmpty(),
+                    crc = crc,
+                )
+            }
+        }
+
         /** The single "we're back in the library" cleanup: drop the current-game pointer (so
          *  Settings reverts to Global scope) and hand the Activity's rotation back to the
          *  launcher preference.
@@ -672,24 +692,28 @@ open class MainActivityRuntime : ComponentActivity() {
         private const val PAD_CODE_TRIANGLE = 100
         private const val PAD_CODE_CROSS = 96
 
-        /** How long to keep the combo held. Titles probe it at very different points — some well
-         *  after the PS2 logo — so this deliberately spans the whole boot sequence. */
-        private const val AUTO_PROGRESSIVE_HOLD_MS = 30_000L
-        /// How often the synthetic Triangle+Cross hold is re-pressed. Must be well under a frame
-        /// budget's worth of pad polling so the game never samples a gap, and short enough that a
-        /// pad re-init can't swallow the whole hold.
+        /** Hard ceiling on the hold, from the first press: a full BIOS intro before the ELF plus the
+         *  post-ELF window below. Titles probe the combo at very different points, so this
+         *  deliberately spans the whole boot sequence. */
+        private const val AUTO_PROGRESSIVE_HOLD_MS = 60_000L
         // Achievement-progress capture cadence. The first wait lets RetroAchievements resolve the
         // set over the network after boot; the poll only exists so a process killed mid-session
         // still leaves a recent figure in the library. Neither is latency-sensitive.
         private const val ACHIEVEMENT_SNAPSHOT_FIRST_MS = 15_000L
         private const val ACHIEVEMENT_SNAPSHOT_POLL_MS = 120_000L
 
+        /// How often the synthetic Triangle+Cross hold is re-pressed. Must be well under a frame
+        /// budget's worth of pad polling so the game never samples a gap, and short enough that a
+        /// pad re-init can't swallow the whole hold.
         private const val AUTO_PROGRESSIVE_REASSERT_MS = 200L
-        /// Keep holding this long after the game's ELF starts, then let go — the 480p prompt is
-        /// checked at game start, and holding into the menus would fight the player. 8 s (up from 4)
-        /// gives margin for titles that probe a few seconds into the ELF, once past the intro logos;
-        /// a continuously-held button presents no fresh press edge, so it won't drive early menus.
-        private const val AUTO_PROGRESSIVE_POST_ELF_MS = 8_000L
+        /// Re-press only until the ELF has run this long, which covers the pad setup at boot. After
+        /// that the hold rests on the pad state alone, so a button the player presses and lets go
+        /// stays released instead of being pressed again under them.
+        private const val AUTO_PROGRESSIVE_REASSERT_POST_ELF_MS = 3_000L
+        /// Keep holding this long after the game's ELF starts, then let go. Criterion titles such as
+        /// Burnout 3 look for the combo well into their intro, after the publisher logos. A held
+        /// button presents no fresh press edge, so it does not drive the menus in the meantime.
+        private const val AUTO_PROGRESSIVE_POST_ELF_MS = 30_000L
 
         /** Pad writes are dropped while no VM exists (applyPadButton bails on !HasValidVM), so
          *  wait for boot rather than pressing into the void. Bounded so a failed boot can't spin. */
@@ -714,23 +738,24 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (!NativeApp.hasActiveVM())
                         return@launch
                     held = true
-                    // Re-assert on a short interval rather than pressing once. The state itself
-                    // persists (Pad::SetControllerState), so a single press would mostly work — but
-                    // re-pressing cheaply survives the pad (re)init during boot ("Pad: DS2 Config
+                    // Re-assert on a short interval through boot rather than pressing once. The state
+                    // itself persists (Pad::SetControllerState), so a single press would mostly work,
+                    // but re-pressing cheaply survives the pad (re)init during boot ("Pad: DS2 Config
                     // Finished" lands after the VM goes active) with no gap for the game to sample.
                     //
-                    // Release shortly after the game's own ELF starts rather than blocking for the
-                    // full timeout: the 480p prompt is checked at game start, and continuing to jam
-                    // Triangle+Cross into a booted game would fight the player in the menus. CRC
-                    // goes non-zero exactly when the ELF is running, so it is the right edge to
-                    // watch. AUTO_PROGRESSIVE_HOLD_MS remains the hard ceiling.
+                    // Let go once the game's own ELF has run for AUTO_PROGRESSIVE_POST_ELF_MS: holding
+                    // Triangle+Cross any longer would fight the player in the menus. CRC goes non-zero
+                    // exactly when the ELF is running, so it is the right edge to watch.
+                    // AUTO_PROGRESSIVE_HOLD_MS remains the hard ceiling.
                     var elapsed = 0L
                     var sinceElf = -1L
                     while (elapsed < AUTO_PROGRESSIVE_HOLD_MS) {
                         if (!NativeApp.hasActiveVM())
                             return@launch
-                        NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, true)
-                        NativeApp.setPadButton(PAD_CODE_CROSS, 0, true)
+                        if (sinceElf < AUTO_PROGRESSIVE_REASSERT_POST_ELF_MS) {
+                            NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, true)
+                            NativeApp.setPadButton(PAD_CODE_CROSS, 0, true)
+                        }
                         delay(AUTO_PROGRESSIVE_REASSERT_MS)
                         elapsed += AUTO_PROGRESSIVE_REASSERT_MS
                         val elfRunning = runCatching { NativeApp.getGameCRC() }.getOrNull()
@@ -789,6 +814,9 @@ open class MainActivityRuntime : ComponentActivity() {
             memoryCardRecoveryBypass = false
 
             invoke {
+                // Set once the VM thread has returned. A Java exception or a dead process leaves it
+                // false and the crash marker armed (see BugReport.armCrashMarker).
+                var vmReturned = false
                 try {
                     eState.value = EmuState.RUNNING
                     clearLatches()
@@ -848,11 +876,17 @@ open class MainActivityRuntime : ComponentActivity() {
                     stagePerGameSettingsFile(currentGame.value?.settingsKey)
                     // The microphones as they are now, by name, for a game that opens one (MicDevices).
                     runCatching { instance?.applicationContext?.let { com.armsx2.input.MicDevices.push(it) } }
+                    // Armed on disk before the VM can take the process down, cleared below when the
+                    // VM thread returns in an orderly way. Still armed at the next launch = a crash.
+                    armBugReportMarker(identifyDisc = !arcadeLaunch)
                     if (arcadeLaunch)
                         runArcadeGame(m_szGamefile)
                     else
                         NativeApp.runVMThread(m_szGamefile)
+                    vmReturned = true
+                    if (!arcadeLaunch) noteBootFailure("bugreport.boot.message", biosAdvice = true)
                 } finally {
+                    if (vmReturned) runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
                     // runVMThread blocks until the VM exits (Stopping/Shutdown
                     // observed). Drop back to STOPPED only after native has
                     // actually unwound, so users can't launch the next game
@@ -952,8 +986,32 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.arcade.Arcade.sessionGameId.value = null
                 com.armsx2.arcade.ArcadeControls.apply(null)
             }
-            runCatching { NativeApp.getLastBootError() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { error ->
-                com.armsx2.arcade.Arcade.notice.value = com.armsx2.i18n.I18n.get("arcade.error.boot").format(error)
+            // Shown with a "Report a problem" button, like any other game that fails to start.
+            noteBootFailure("arcade.error.boot", biosAdvice = false)
+        }
+
+        /**
+         * After a VM thread returns: if the core says the game could not boot, show why and offer a
+         * problem report. [messageKey] is the string that wraps the core's description. The marker
+         * was never going to say anything about this, since nothing crashed.
+         *
+         * With [biosAdvice], a boot the core refused for want of a usable BIOS gets this app's own
+         * advice: the core's text for a missing BIOS describes the desktop app's folders and menus.
+         * Arcade launches go without it, since Arcade.prepare checks their BIOS before booting and
+         * the core's arcade text already says what to do.
+         */
+        private fun noteBootFailure(messageKey: String, biosAdvice: Boolean) {
+            val error = runCatching { NativeApp.getLastBootError() }.getOrNull().orEmpty()
+            if (error.isBlank()) return
+            val result = runCatching { NativeApp.getLastBootResult() }.getOrDefault(NativeApp.BOOT_RESULT_FAILURE)
+            runCatching {
+                val i18n = com.armsx2.i18n.I18n
+                val text = when {
+                    biosAdvice && result == NativeApp.BOOT_RESULT_BIOS_NOT_FOUND -> i18n.get("bugreport.boot.biosMissing")
+                    biosAdvice && result == NativeApp.BOOT_RESULT_BIOS_NOT_USABLE -> i18n.get("bugreport.boot.biosBad").format(error)
+                    else -> i18n.get(messageKey).format(error)
+                }
+                com.armsx2.bugreport.BugReport.noteBootFailure(text)
             }
         }
 
@@ -1297,6 +1355,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 return
             }
             invoke {
+                var vmReturned = false
                 try {
                     eState.value = EmuState.RUNNING
                     clearLatches()
@@ -1317,8 +1376,12 @@ open class MainActivityRuntime : ComponentActivity() {
                     }
                     // No game of its own, so nothing staged by an earlier launch may be written.
                     stagePerGameSettingsFile(null)
+                    armBugReportMarker(identifyDisc = false)
                     NativeApp.runVMThread(m_szGamefile)
+                    vmReturned = true
+                    noteBootFailure("bugreport.boot.message", biosAdvice = true)
                 } finally {
+                    if (vmReturned) runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
                     eState.value = EmuState.STOPPED
                     val restartNow = synchronized(vmLifecycleLock) {
                         vmRunLoopActive = false
@@ -1803,6 +1866,8 @@ open class MainActivityRuntime : ComponentActivity() {
          *  Polls every 250ms, giving up after ~15s if the game never starts presenting. */
         @JvmStatic
         fun onVmRunning() {
+            // The GS device is open by the time the VM runs: record which driver it really got.
+            runCatching { com.armsx2.bugreport.BugReport.noteRendererOpened() }
             adoptExternalGameIdentity()
             val requestedSlot = pendingSlotLoadOnBoot
             val requestedFile = pendingFileLoadOnBoot
@@ -1956,6 +2021,8 @@ open class MainActivityRuntime : ComponentActivity() {
          *  chosen data root. Used after the user moves app data between Internal
          *  and SD in the setup wizard. */
         fun restartApp(context: Context) {
+            // An exit the app chose is not a crash, even with a game running.
+            runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
             val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
             if (intent != null) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
@@ -2299,6 +2366,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // than deciding again, every Kotlin caller of assetCopyRoot gets it from here on, and a
         // later storage change is detected against it to trigger a restart.
         lastInitDataRoot = lastInitDataRoot ?: resolveDataRoot(applicationContext)
+        // Before the core starts and before any game can boot: if the last run died with a game
+        // running, its emulog is still on disk and the next boot would truncate it.
+        runCatching { lastInitDataRoot?.let { com.armsx2.bugreport.BugReport.onDataRootReady(it) } }
 
         // #9: one-time recovery for a fresh install that reuses an old data folder — restore
         // settings from the in-folder mirror, or seed from the folder's old PCSX2-Android.ini,
@@ -2311,6 +2381,8 @@ open class MainActivityRuntime : ComponentActivity() {
         // One-time: existing capable devices also get the Low Latency default (matches fresh installs).
         runCatching { com.armsx2.config.ConfigStore.migrateLowLatencyOff(applicationContext) }
         runCatching { com.armsx2.config.ConfigStore.migrateAffinityPerfCores(applicationContext) }
+        runCatching { com.armsx2.config.ConfigStore.migrateIopThreadLag() }
+        runCatching { com.armsx2.config.ConfigStore.migrateIopThreadNarrowTier() }
         runCatching { com.armsx2.config.ConfigStore.migrateAchievementsToSettings() }
         // Steer the renderer's Auto resolution. Vulkan HW on Adreno (tile-memory framebuffer-fetch
         // fast path), on any device whose GL driver cannot read the render target in-tile (OpenGL then
@@ -2719,6 +2791,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // while the activity is paused.
         getSystemService(android.hardware.input.InputManager::class.java)
             ?.registerInputDeviceListener(inputDeviceListener, null)
+        // The listener only reports changes from here on, and the activity can be recreated while
+        // the process (and TouchControls' last answer) lives on, so ask again.
+        com.armsx2.ui.touch.TouchControls.refreshGamepadConnected()
         setupComplete.value = prefs.getBoolean("setupComplete", false)
         systemDir.value = prefs.getString("systemDir", null)
         bios.value = prefs.getString("bios", null)
@@ -6094,6 +6169,8 @@ open class MainActivityRuntime : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        // A game that is running is in view again: its crash marker says foreground (BugReport).
+        runCatching { com.armsx2.bugreport.BugReport.onActivityStarted() }
         runCatching { NativeApp.setAppBackgrounded(false) }
         com.armsx2.DiscordPresence.setForeground(true)
         // Keeps the core's microphone list current while microphones are plugged in and out (MicDevices).
@@ -6105,6 +6182,9 @@ open class MainActivityRuntime : ComponentActivity() {
     // resume; out of sight that kept Android's audio mixer holding a wakelock overnight with the
     // device locked. Native pauses it for real until onStart. Discord idles too.
     override fun onStop() {
+        // First, and on disk before anything else here can stall: from now on a death of this
+        // process is not one the user was there to see.
+        runCatching { com.armsx2.bugreport.BugReport.onActivityStopped() }
         runCatching { NativeApp.setAppBackgrounded(true) }
         com.armsx2.DiscordPresence.setForeground(false)
         super.onStop()
@@ -6164,6 +6244,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // down (it would flicker away and rebuild on every rotation/density change).
         runCatching { com.armsx2.SecondScreen.release(applicationContext) }
         NativeApp.shutdown()
+        // The game was stopped by the app's own exit. The VM thread's own clear races the kill
+        // below, so do it here, where it is certain to run before the process goes.
+        runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
         super.onDestroy()
 
         val appPid = Process.myPid()

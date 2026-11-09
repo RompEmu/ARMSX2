@@ -75,6 +75,10 @@ public:
 		/// only while GSConfig.LsfgFp16 is on, so nobody else's device changes.
 		bool vk_khr_shader_float16_int8 : 1;
 		bool vk_ext_device_fault : 1;
+		/// VK_EXT_image_compression_control: an image can be created without framebuffer
+		/// compression. Requested on Adreno only; used by the Adreno 613's destination-alpha loop to
+		/// leave uncompressed the targets that loop reads (GSTextureVK::MakeUncompressed).
+		bool vk_ext_image_compression_control : 1;
 		/// VK_ANDROID_external_memory_android_hardware_buffer with VK_EXT_queue_family_foreign:
 		/// remote play's frames go to the video encoder as shared buffers (GSRemotePlay.h).
 		bool vk_android_external_memory_ahb : 1;
@@ -335,6 +339,18 @@ private:
 
 	VkRenderPass CreateCachedRenderPass(RenderPassCacheKey key);
 
+	/// Arm's driver mishandles depth/stencil attachments whose two aspects have different load ops.
+	/// PanVK and malisx2 take the ops as asked.
+	bool MatchesDepthStencilLoadOps() const;
+
+	/// An aspect that asked for CLEAR while the other asked for LOAD: both LOAD, and it gets cleared when the
+	/// pass begins.
+	struct LateDepthStencilClear
+	{
+		VkImageAspectFlags aspects;
+		u32 attachment;
+	};
+
 	void CommandBufferCompleted(u32 index);
 	void ActivateCommandBuffer(u32 index);
 	void WaitForCommandBufferCompletion(u32 index);
@@ -469,6 +485,8 @@ private:
 	bool m_last_submit_failed = false;
 
 	std::map<u32, VkRenderPass> m_render_pass_cache;
+	// Keyed by the pass handle, which is unique to the ops the pass was asked for.
+	std::unordered_map<VkRenderPass, LateDepthStencilClear> m_late_depth_stencil_clears;
 
 	VkDebugUtilsMessengerEXT m_debug_messenger_callback = VK_NULL_HANDLE;
 
@@ -529,6 +547,8 @@ public:
 				u32 line_width : 1;
 				u32 feedback_loop_flags : 3;
 				u32 raster_order : 1;
+				// GSHWDrawConfig::stencil_counter: 0 off, 1 INCR_WRAP, 2 DECR_WRAP where the depth test passes.
+				u32 stencil_counter : 2;
 			};
 
 			u32 key;
@@ -626,6 +646,12 @@ private:
 	std::array<VkPipeline, NUM_INTERLACE_SHADERS> m_interlace{};
 	VkPipeline m_colclip_setup_pipelines[2][2] = {}; // [depth][feedback_loop]
 	VkPipeline m_colclip_finish_pipelines[2][2] = {}; // [depth][feedback_loop]
+
+	// The stencil counter's resolve (DrawStencilCounter): reads a copy of the target and the stencil
+	// aspect, so it has its own two-texture layout. One pipeline per RGB write mask, made on first use.
+	VkDescriptorSetLayout m_stencil_counter_ds_layout = VK_NULL_HANDLE;
+	VkPipelineLayout m_stencil_counter_pipeline_layout = VK_NULL_HANDLE;
+	std::array<VkPipeline, 8> m_stencil_counter_resolve_pipelines = {};
 	VkRenderPass m_primid_image_setup_render_passes[2][2] = {}; // [depth][clear]
 	VkPipeline m_primid_image_setup_pipelines[2][4] = {}; // [depth][datm]
 	VkPipeline m_fxaa_pipeline = {};
@@ -648,6 +674,9 @@ private:
 		m_tfx_fragment_shaders;
 	/// GS thread only. A precompiled pipeline moves in here when it is first drawn with.
 	std::unordered_map<PipelineSelector, VkPipeline, PipelineSelectorHash> m_tfx_pipelines;
+	// The last lookup: consecutive draws often use the same pipeline, and a match skips the hash and bucket walk.
+	PipelineSelector m_last_tfx_selector = {};
+	VkPipeline m_last_tfx_pipeline = VK_NULL_HANDLE;
 
 	// Pipeline precompile. Each game's TFX pipeline keys are recorded in a pack in the game's cache
 	// directory as they are first created; when that game starts again, worker threads build the
@@ -927,6 +956,11 @@ public:
 	void DoFilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) override;
 
 	void SetupDATE(GSTexture* rt, GSTexture* ds, SetDATM datm, const GSVector4i& bbox);
+	/// Draws a GSHWDrawConfig::stencil_counter draw: the count into the stencil, then the resolve into the
+	/// target. Returns false, having changed nothing, when it cannot (a temporary could not be made),
+	/// and the caller draws the config on the colour-clip road it was built for.
+	bool DrawStencilCounter(GSHWDrawConfig& config);
+	VkPipeline GetStencilCounterResolvePipeline(u32 rgb_mask);
 	GSTextureVK* SetupPrimitiveTrackingDATE(GSHWDrawConfig& config);
 
 	void IASetVertexBuffer(const void* vertex, size_t stride, size_t count, size_t align_multiplier = 1);
@@ -1065,6 +1099,19 @@ private:
 	bool m_warned_slow_spin = false;
 
 	VkBuffer m_index_buffer = VK_NULL_HANDLE;
+
+	// malisx2's own entry point (Bifrost v7, Mali-G52/G76, since malisx2 0.3.2): the index range of the
+	// next indexed draw. Without it, v7 reads every indexed draw's indices back on the CPU, from the
+	// write-combined stream buffer, for its vertex range. Null on every other driver and architecture.
+	using PFN_vkCmdSetIndexRangeMALISX2 = void(VKAPI_PTR*)(
+		VkCommandBuffer commandBuffer, uint32_t firstIndex, uint32_t indexCount, uint32_t minIndex, uint32_t maxIndex);
+	PFN_vkCmdSetIndexRangeMALISX2 m_cmd_set_index_range = nullptr;
+
+	// The smallest and largest index in m_index, when m_index_range_valid: the same range malisx2's
+	// read-back finds, taken from the indices while they are still in cached memory.
+	u16 m_index_min = 0;
+	u16 m_index_max = 0;
+	bool m_index_range_valid = false;
 
 	GSTextureVK* m_current_render_target = nullptr;
 	GSTextureVK* m_current_depth_target = nullptr;

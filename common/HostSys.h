@@ -97,6 +97,12 @@ namespace HostSys
 	extern void* CreateSharedMemory(const char* name, size_t size);
 	extern void DestroySharedMemory(void* ptr);
 
+	/// Zeroes shared memory by handing its pages back to the host. Returns false if that isn't supported.
+	extern bool DiscardSharedMemory(void* ptr, size_t offset, size_t size);
+
+	/// Zeroes private memory, giving whole pages back to the host where possible.
+	extern void DiscardMemory(void* ptr, size_t size);
+
 	/// JIT write protect for Apple Silicon. Needs to be called prior to writing to any RWX pages.
 #if !defined(__APPLE__) || !defined(ARCH_ARM64)
 	// clang-format -off
@@ -138,6 +144,13 @@ namespace PageFaultHandler
 	HandlerResult HandlePageFault(void* exception_pc, void* fault_address, bool is_write);
 	bool Install(Error* error = nullptr);
 	bool InstallSecondaryThread();
+
+	// Linux and Android only. Called for a SIGSEGV or SIGBUS that
+	// HandlePageFault did not take, before the crash handler, with the
+	// handler's siginfo_t and ucontext_t. It runs inside the signal handler of
+	// a process about to die, so it must be async-signal-safe.
+	using UnhandledFaultReporter = void (*)(int signal, void* siginfo, void* ucontext);
+	void SetUnhandledFaultReporter(UnhandledFaultReporter reporter);
 } // namespace PageFaultHandler
 
 class SharedMemoryMappingArea
